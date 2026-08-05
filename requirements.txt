@@ -1,0 +1,10 @@
+PySide6
+matplotlib
+seaborn
+pandas
+numpy
+scipy
+statsmodels
+reportlab
+openpyxl
+pyinstaller
