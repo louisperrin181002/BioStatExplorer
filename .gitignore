@@ -1,0 +1,25 @@
+# PyInstaller build output
+build/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# OS junk
+.DS_Store
+
+# Data files (adjust to your actual data folders/extensions)
+*.csv
+*.xlsx
+
+# Editor/Office temp files
+~$*
+*.backup
