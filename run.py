@@ -350,7 +350,8 @@ class BioStatExplorer(QMainWindow):
         self.control_panel.addWidget(QLabel("<b>Graph Type:</b>"))
         self.chart_selector = QComboBox()
         self.chart_selector.addItems(["Bar", "Line", "Boxplot", "Violin", "Beeswarm", "Box + Swarm", "Scatter",
-                                      "Heatmap", "Volcano Plot", "Dendrogram", "Network Graph", "Stacked Histogram"])
+                                      "Heatmap", "Volcano Plot", "Dendrogram", "Network Graph", "Stacked Histogram",
+                                      "Stacked Bar"])
         self.chart_selector.currentTextChanged.connect(self.update_plot)
         self.control_panel.addWidget(self.chart_selector)
 
@@ -361,7 +362,10 @@ class BioStatExplorer(QMainWindow):
             "Group/Color-By (optional)=point label.<br>"
             "Dendrogram/Network: use every numeric metric column automatically.<br>"
             "Stacked Histogram: bins the Metric column's values; stacks one layer per "
-            "Group/Color-By level (or per X category if Group/Color-By is empty).</i>"
+            "Group/Color-By level (or per X category if Group/Color-By is empty).<br>"
+            "Stacked Bar: one bar per X category, height = sum of Metric values in that "
+            "category, shown as stacked segments (per Group/Color-By level if set, "
+            "otherwise one segment per row).</i>"
         )
         self.chart_help_label.setWordWrap(True)
         self.chart_help_label.setStyleSheet("color: gray; font-size: 10px;")
@@ -874,7 +878,7 @@ class BioStatExplorer(QMainWindow):
         self.update_plot()
 
     def _update_chart_help_visibility(self, chart_type):
-        self.chart_help_label.setVisible(chart_type in ("Heatmap", "Volcano Plot", "Dendrogram", "Network Graph"))
+        self.chart_help_label.setVisible(chart_type in ("Heatmap", "Volcano Plot", "Dendrogram", "Network Graph", "Stacked Bar"))
 
     def on_x_axis_changed(self):
         self.rebuild_hue_and_pairing_selectors()

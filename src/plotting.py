@@ -91,7 +91,7 @@ class PlottingEngine:
         # --- Special plot types: these don't share the categorical group /
         # significance-overlay / xtick-rotation pipeline below, so they draw
         # themselves fully and return early. ---
-        if plot_type in ("Heatmap", "Volcano Plot", "Dendrogram", "Network Graph", "Stacked Histogram"):
+        if plot_type in ("Heatmap", "Volcano Plot", "Dendrogram", "Network Graph", "Stacked Histogram", "Stacked Bar"):
             if plot_type == "Heatmap":
                 PlottingEngine._draw_heatmap(df, x_col, y_col, hue_col, ax, palette, text_color)
             elif plot_type == "Volcano Plot":
@@ -103,6 +103,9 @@ class PlottingEngine:
             elif plot_type == "Stacked Histogram":
                 PlottingEngine._draw_stacked_histogram(df, x_col, y_col, hue_col, ax, resolved_palette,
                                                          text_color, bw_mode, hist_bins)
+            elif plot_type == "Stacked Bar":
+                PlottingEngine._draw_stacked_bar(df, x_col, y_col, hue_col, ax, resolved_palette,
+                                                   text_color, unique_groups, bw_mode, group_colors)
             return
 
         hue_order = color_categories
@@ -358,6 +361,98 @@ class PlottingEngine:
             for text_obj, cat in zip(legend.get_texts(), categories):
                 text_obj.set_picker(True)
                 text_obj.set_url("group_color:" + str(cat))
+        sns.despine(ax=ax, left=True, bottom=True)
+
+    @staticmethod
+    def _draw_stacked_bar(df, x_col, y_col, hue_col, ax, resolved_palette, text_color,
+                           unique_groups, bw_mode=False, group_colors=None):
+        """
+        Stacked bar chart: one bar per x_col category, with the bar's total
+        height being the sum of y_col across that category's rows - shown as
+        stacked segments. If a Group/Color-By column is set, each segment is
+        the sum of y_col for that hue level within the x category (the
+        classic "stacked bar of sub-totals" layout). Otherwise, each row
+        belonging to that x category becomes its own stacked segment (e.g.
+        stacking individual replicate readings into one total-per-sample bar).
+        """
+        hatch_cycle = ["", "///", "...", "xxx", "\\\\\\", "+++", "ooo"]
+        df_clean = df[[x_col, y_col] + ([hue_col] if hue_col else [])].dropna(subset=[x_col, y_col])
+        df_clean[y_col] = pd.to_numeric(df_clean[y_col], errors="coerce")
+        df_clean = df_clean.dropna(subset=[y_col])
+
+        if df_clean.empty:
+            ax.text(0.5, 0.5, f"Not enough numeric data in '{y_col}' to build a stacked bar chart",
+                    ha="center", va="center", transform=ax.transAxes, color=text_color)
+            return
+
+        x_positions = list(range(len(unique_groups)))
+
+        if hue_col:
+            # One segment per hue level, each segment = sum of y_col for that
+            # (x_col, hue level) combination.
+            hue_levels = list(df_clean[hue_col].dropna().unique())
+            colors = resolved_palette if len(resolved_palette) >= len(hue_levels) else \
+                sns.color_palette("muted", n_colors=max(len(hue_levels), 1))
+
+            bottoms = [0.0] * len(unique_groups)
+            for h_idx, h_level in enumerate(hue_levels):
+                sub = df_clean[df_clean[hue_col] == h_level]
+                heights = [sub[sub[x_col] == g][y_col].sum() for g in unique_groups]
+                bars = ax.bar(x_positions, heights, bottom=bottoms, width=0.6,
+                               color=colors[h_idx], label=str(h_level),
+                               edgecolor=text_color, linewidth=0.6)
+                if bw_mode:
+                    for b in bars:
+                        b.set_hatch(hatch_cycle[h_idx % len(hatch_cycle)])
+                bottoms = [b + h for b, h in zip(bottoms, heights)]
+
+            legend = ax.legend(title=hue_col, fontsize=8, title_fontsize=9)
+            if legend:
+                for text_obj, lbl in zip(legend.get_texts(), hue_levels):
+                    text_obj.set_picker(True)
+                    text_obj.set_url("group_color:" + str(lbl))
+        else:
+            # No hue column: stack each row within a category as its own
+            # segment, so e.g. 2 replicate values for "a" become 2 segments
+            # in one bar, totalling their sum. Segments are named "Value 1",
+            # "Value 2"... and are individually recolorable via their legend
+            # entry (group_colors is keyed by that same name).
+            group_colors = group_colors or {}
+            max_rows = int(df_clean.groupby(x_col).size().max())
+            default_colors = sns.color_palette("muted", n_colors=max(max_rows, 1))
+            segment_names = [f"Value {i + 1}" for i in range(max_rows)]
+            colors = [group_colors.get(name, default_colors[i]) for i, name in enumerate(segment_names)]
+
+            bottoms = [0.0] * len(unique_groups)
+            for row_idx, seg_name in enumerate(segment_names):
+                heights = []
+                for g in unique_groups:
+                    vals = df_clean[df_clean[x_col] == g][y_col].values
+                    heights.append(vals[row_idx] if row_idx < len(vals) else 0.0)
+                bars = ax.bar(x_positions, heights, bottom=bottoms, width=0.6,
+                               color=colors[row_idx], label=seg_name,
+                               edgecolor=text_color, linewidth=0.6)
+                if bw_mode:
+                    for b in bars:
+                        b.set_hatch(hatch_cycle[row_idx % len(hatch_cycle)])
+                bottoms = [b + h for b, h in zip(bottoms, heights)]
+
+            if max_rows > 1:
+                legend = ax.legend(fontsize=8)
+                if legend:
+                    for text_obj, seg_name in zip(legend.get_texts(), segment_names):
+                        text_obj.set_picker(True)
+                        text_obj.set_url("group_color:" + seg_name)
+
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels([str(g) for g in unique_groups], rotation=45,
+                            horizontalalignment="right", fontsize=10)
+
+        ax.set_title(f"Stacked total {y_col} by {x_col}" + (f" (by {hue_col})" if hue_col else ""),
+                     fontsize=14, fontweight="bold", pad=15, color=text_color)
+        ax.set_xlabel(x_col, fontsize=12, fontweight="bold", color=text_color)
+        ax.set_ylabel(y_col, fontsize=12, fontweight="bold", color=text_color)
+        ax.tick_params(colors=text_color)
         sns.despine(ax=ax, left=True, bottom=True)
 
     @staticmethod
