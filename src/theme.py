@@ -21,8 +21,8 @@ def stylesheet(dark=False):
 QMainWindow, QWidget {{ background: {t['bg']}; color: {t['text']}; }}
 QToolBar {{ background: {t['surface']}; border: none;
     border-bottom: 1px solid {t['border']}; padding: 6px 10px; spacing: 6px; }}
-QToolBar QToolButton {{ padding: 6px 12px; border-radius: 6px;
-    color: {t['text']}; font-weight: 500; }}
+QToolBar QToolButton {{ padding: 6px 12px; border-radius: 6px; border: none;
+    background: transparent; color: {t['text']}; font-weight: 500; }}
 QToolBar QToolButton:hover {{ background: {t['surface2']}; }}
 QToolBar QToolButton#Primary {{ background: {t['accent']}; color: white; }}
 QToolBar QToolButton#Primary:hover {{ background: {t['accent_hi']}; }}
@@ -85,6 +85,22 @@ QMenu {{ background: {t['surface']}; border: 1px solid {t['border2']};
     padding: 4px; }}
 QMenu::item {{ padding: 6px 18px; border-radius: 4px; }}
 QMenu::item:selected {{ background: {t['accent_bg']}; color: {t['text']}; }}
+QLabel#Section {{ color: {t['muted']}; font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.6px; padding-top: 8px; }}
+QWidget#Card {{ background: {t['surface']}; border: 1px solid {t['border']};
+    border-radius: 10px; }}
+QTabWidget#ControlTabs::pane {{ background: {t['surface']};
+    border: 1px solid {t['border']}; border-radius: 10px; top: -1px; }}
+QTabWidget#ControlTabs QScrollArea, QTabWidget#ControlTabs QScrollArea > QWidget > QWidget {{
+    background: {t['surface']}; }}
+QTabWidget#ControlTabs QTabBar::tab {{ padding: 7px 14px; }}
+QListWidget {{ outline: none; }}
+QListWidget::item {{ padding: 4px 4px; border-radius: 5px; }}
+QListWidget::item:selected {{ background: {t['accent_bg']}; color: {t['text']}; }}
+QListWidget::item:hover {{ background: {t['surface2']}; }}
+QToolButton {{ background: {t['surface']}; border: 1px solid {t['border2']};
+    border-radius: 5px; padding: 3px 8px; color: {t['text']}; }}
+QToolButton:hover {{ background: {t['surface2']}; }}
 #dropLabel {{ border: 2px dashed {t['border2']}; border-radius: 12px;
     background: {t['surface']}; color: {t['muted']}; font-size: 15px; }}
 """

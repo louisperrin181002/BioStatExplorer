@@ -11,14 +11,16 @@ from PySide6.QtWidgets import (
     QLabel, QStatusBar, QListWidget, QListWidgetItem, QComboBox, QTabWidget, QPushButton,
     QAbstractItemView, QTextEdit, QGroupBox, QDoubleSpinBox, QCheckBox, QScrollArea,
     QSpinBox, QLineEdit, QInputDialog, QMessageBox, QGridLayout, QColorDialog, QMenu,
-    QTableView, QToolBar, QToolButton, QDialog, QDialogButtonBox, QHeaderView
+    QTableView, QToolBar, QToolButton, QDialog, QDialogButtonBox, QHeaderView,
+    QFormLayout
 )
 from PySide6.QtGui import QAction, QKeySequence, QColor, QCursor
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 from src.excel_loader import DataLoader, sheet_names, read_grid
-from src.plotting import PlottingEngine
+from src.plotting import PlottingEngine, PALETTE_NAMES, palette_colors
+from src.groups_panel import GroupsPanel
 from src.filters import FilterEngine
 from src.normalization import NormalizationEngine
 from src.statistics_engine import StatisticsEngine, format_p, stars
@@ -384,6 +386,8 @@ class BioStatExplorer(QMainWindow):
         # Manual x-axis group ordering, set by right-clicking a group's
         # x-tick label or legend entry and choosing a "Move..." action.
         self.group_order = []
+        # Order of the Color-By series (legend / bars within a group)
+        self.hue_order = []
 
         # Populated on load: which columns are recognized signal/value columns
         # vs. which are metadata/categorical columns usable for filtering.
@@ -395,6 +399,7 @@ class BioStatExplorer(QMainWindow):
         self.init_central_widget()
         self.init_dock_panels()
         self.init_menu()
+        self._building = False
         self.apply_theme()
 
         self.status_bar = QStatusBar()
@@ -442,8 +447,9 @@ class BioStatExplorer(QMainWindow):
         self.dark_action = QAction("Dark Mode", self, checkable=True)
         self.dark_action.toggled.connect(self.toggle_dark_theme)
         view_menu.addAction(self.dark_action)
-        view_menu.addAction(self.dock.toggleViewAction() if hasattr(self, "dock")
-                            else QAction("Filters", self))
+        filt = self.dock.toggleViewAction()
+        filt.setText("Filters Panel (filters every tab)")
+        view_menu.addAction(filt)
 
         tb = QToolBar("Main")
         tb.setMovable(False)
@@ -470,6 +476,7 @@ class BioStatExplorer(QMainWindow):
         tb.addWidget(exp)
 
     def init_central_widget(self):
+        self._building = True          # no redraws until everything exists
         self.tabs = QTabWidget()
 
         # Tab 1: Data View
@@ -491,253 +498,200 @@ class BioStatExplorer(QMainWindow):
         self.graph_tab = QWidget()
         self.graph_layout = QHBoxLayout(self.graph_tab)
 
-        control_scroll = QScrollArea()
-        control_scroll.setWidgetResizable(True)
-        control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        control_scroll.setMinimumWidth(330)
-        control_host = QWidget()
-        self.control_panel = QVBoxLayout(control_host)
-        control_scroll.setWidget(control_host)
+        # Controls: three compact tabs; only what applies is shown
+        def form_page():
+            page = QWidget()
+            form = QFormLayout(page)
+            form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+            form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+            form.setVerticalSpacing(8)
+            form.setContentsMargins(10, 12, 10, 10)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            scroll.setWidget(page)
+            return scroll, form
 
-        # --- Styling ---
-        style_group = QGroupBox("Look")
-        style_box = QVBoxLayout()
-        self.dark_mode_cb = QCheckBox("Enable Dark Mode")
-        self.dark_mode_cb.toggled.connect(self.toggle_dark_theme)
-        style_box.addWidget(self.dark_mode_cb)
+        def section(form, text):
+            lab = QLabel(text)
+            lab.setObjectName("Section")
+            form.addRow(lab)
 
-        style_box.addWidget(QLabel("Plot Color Palette:"))
-        self.palette_selector = QComboBox()
-        self.palette_selector.addItems(["muted", "deep", "colorblind", "rocket", "crest"])
-        self.palette_selector.currentTextChanged.connect(self.update_plot)
-        style_box.addWidget(self.palette_selector)
+        def combo(slot):
+            c = QComboBox()
+            c.currentTextChanged.connect(slot)
+            return c
 
-        self.bw_mode_cb = QCheckBox("Black && white (grey + hatching)")
-        self.bw_mode_cb.setToolTip(
-            "Overrides colors with grayscale shades, and adds hatch patterns "
-            "(bars/histograms) or distinct line styles/markers (line plots) "
-            "so groups stay distinguishable without color - handy for print.")
-        self.bw_mode_cb.toggled.connect(self.update_plot)
-        style_box.addWidget(self.bw_mode_cb)
+        def check(text, slot=None):
+            c = QCheckBox(text)
+            c.toggled.connect(slot or self.update_plot)
+            return c
 
-        reset_colors_btn = QPushButton("Reset custom colors")
-        reset_colors_btn.setToolTip("Click a bar/box's x-axis label (or a legend entry) on the graph to recolor it. This clears all such overrides.")
-        reset_colors_btn.clicked.connect(self.reset_group_colors)
-        style_box.addWidget(reset_colors_btn)
+        def spin(lo, hi, val, decimals=3):
+            sb = QDoubleSpinBox()
+            sb.setRange(lo, hi)
+            sb.setDecimals(decimals)
+            sb.setValue(val)
+            sb.valueChanged.connect(self.update_plot)
+            return sb
 
-        reset_order_btn = QPushButton("Reset sample order")
-        reset_order_btn.setToolTip("Right-click a group's x-axis label (or a legend entry) on the graph to move it left/right. This clears all such overrides.")
-        reset_order_btn.clicked.connect(self.reset_group_order)
-        style_box.addWidget(reset_order_btn)
+        self.control_tabs = QTabWidget()
+        self.control_tabs.setObjectName("ControlTabs")
+        self.control_tabs.setMinimumWidth(320)
+        self.control_tabs.setMaximumWidth(380)
 
-        reset_labels_btn = QPushButton("Reset title / axis labels")
-        reset_labels_btn.setToolTip("Click the graph title or an axis label to edit it. This restores the auto-generated text.")
-        reset_labels_btn.clicked.connect(self.reset_custom_labels)
-        style_box.addWidget(reset_labels_btn)
-
-        style_group.setLayout(style_box)
-        self.control_panel.addWidget(style_group)
-
-        # --- Data selection: axis, metric, grouping ---
-        axis_group = QGroupBox("Data To Plot")
-        axis_box = QVBoxLayout()
-
-        axis_box.addWidget(QLabel("<b>X Axis (category):</b>"))
-        self.x_selector = QComboBox()
-        self.x_selector.currentTextChanged.connect(self.on_x_axis_changed)
-        axis_box.addWidget(self.x_selector)
-
-        axis_box.addWidget(QLabel("<b>Metric (Y axis):</b>"))
-        self.y_selector = QComboBox()
-        self.y_selector.currentTextChanged.connect(self.update_plot)
-        axis_box.addWidget(self.y_selector)
-
-        self.show_all_metrics_cb = QCheckBox("Show all recognized metrics (stacked subplots)")
-        self.show_all_metrics_cb.toggled.connect(self.update_plot)
-        axis_box.addWidget(self.show_all_metrics_cb)
-
-        axis_box.addWidget(QLabel("<b>Group / Color By (optional):</b>"))
-        self.hue_selector = QComboBox()
-        self.hue_selector.currentTextChanged.connect(self.update_plot)
-        axis_box.addWidget(self.hue_selector)
-
-        axis_group.setLayout(axis_box)
-        self.control_panel.addWidget(axis_group)
-
-        # --- Chart type ---
-        self.control_panel.addWidget(QLabel("<b>Graph Type:</b>"))
-        self.chart_selector = QComboBox()
-        self.chart_selector.addItems(["Bar", "Line", "Boxplot", "Violin", "Beeswarm", "Box + Swarm", "Scatter",
-                                      "Heatmap", "Volcano Plot", "Dendrogram", "Network Graph", "Stacked Histogram",
-                                      "Stacked Bar"])
-        self.chart_selector.currentTextChanged.connect(self.update_plot)
-        self.control_panel.addWidget(self.chart_selector)
-
-        self.chart_help_label = QLabel(
-            "<i>Heatmap: X=rows, Group/Color-By=columns (or leave Group/Color-By empty to "
-            "profile all numeric metrics per X group).<br>"
-            "Volcano: X=log2 fold-change column, Metric=p-value column, "
-            "Group/Color-By (optional)=point label.<br>"
-            "Dendrogram/Network: use every numeric metric column automatically.<br>"
-            "Stacked Histogram: bins the Metric column's values; stacks one layer per "
-            "Group/Color-By level (or per X category if Group/Color-By is empty).<br>"
-            "Stacked Bar: one bar per X category, height = sum of Metric values in that "
-            "category, shown as stacked segments (per Group/Color-By level if set, "
-            "otherwise one segment per row).</i>"
-        )
+        # --- Data ---
+        data_scroll, f = form_page()
+        self.chart_selector = combo(self.update_plot)
+        self.chart_selector.addItems(["Bar", "Box + Swarm", "Boxplot", "Violin", "Beeswarm",
+                                      "Scatter", "Line", "Stacked Bar", "Stacked Histogram",
+                                      "Heatmap", "Volcano Plot", "Dendrogram", "Network Graph"])
+        f.addRow("Graph", self.chart_selector)
+        self.x_selector = combo(self.on_x_axis_changed)
+        f.addRow("X axis", self.x_selector)
+        self.y_selector = combo(self.update_plot)
+        f.addRow("Metric", self.y_selector)
+        self.hue_selector = combo(self.update_plot)
+        self.hue_selector.setToolTip("Splits each X group into coloured bars/boxes")
+        f.addRow("Color by", self.hue_selector)
+        self.show_all_metrics_cb = check("All metrics (one panel each)")
+        f.addRow("", self.show_all_metrics_cb)
+        self.chart_help_label = QLabel()
         self.chart_help_label.setWordWrap(True)
-        self.chart_help_label.setStyleSheet("color: gray; font-size: 10px;")
-        self.chart_help_label.setVisible(False)
-        self.control_panel.addWidget(self.chart_help_label)
-        self.chart_selector.currentTextChanged.connect(self._update_chart_help_visibility)
+        self.chart_help_label.setObjectName("Hint")
+        f.addRow(self.chart_help_label)
+        section(f, "Show only")
+        self.data_selection_layout = QVBoxLayout()
+        self.data_selection_layout.setSpacing(6)
+        f.addRow(self.data_selection_layout)
+        self.control_tabs.addTab(data_scroll, "Data")
 
-        # --- Significance overlay ---
-        stats_overlay_group = QGroupBox("Significance Overlay")
-        stats_overlay_box = QVBoxLayout()
-
-        stats_overlay_box.addWidget(QLabel("Statistical Test:"))
-        self.stat_mode_selector = QComboBox()
-        self.stat_mode_selector.addItems(StatisticsEngine.ALL_TESTS)
-        self.stat_mode_selector.currentTextChanged.connect(self.update_plot)
-        stats_overlay_box.addWidget(self.stat_mode_selector)
-
-        stats_overlay_box.addWidget(QLabel("Compare To (reference group):"))
-        self.reference_selector = QComboBox()
-        self.reference_selector.currentTextChanged.connect(self.update_plot)
-        stats_overlay_box.addWidget(self.reference_selector)
-
-        stats_overlay_box.addWidget(QLabel("Pairing Column (for paired tests only):"))
-        self.pairing_selector = QComboBox()
-        self.pairing_selector.currentTextChanged.connect(self.update_plot)
-        stats_overlay_box.addWidget(self.pairing_selector)
-
-        self.show_pvalue_cb = QCheckBox("Show p-values on plot")
-        self.show_pvalue_cb.toggled.connect(self.update_plot)
-        stats_overlay_box.addWidget(self.show_pvalue_cb)
-        self.show_ns_cb = QCheckBox("Also show non-significant (ns)")
-        self.show_ns_cb.toggled.connect(self.update_plot)
-        stats_overlay_box.addWidget(self.show_ns_cb)
-        overlay_hint = QLabel("Stars use the same tests and corrections as the "
-                              "Statistical Analysis tab. With a Group / Color By "
-                              "column, colours are compared within each X group.")
-        overlay_hint.setWordWrap(True)
-        overlay_hint.setObjectName("Hint")
-        stats_overlay_box.addWidget(overlay_hint)
-
-        stats_overlay_group.setLayout(stats_overlay_box)
-        self.control_panel.addWidget(stats_overlay_group)
-
-        # --- Options ---
-        options_group = QGroupBox("Options")
-        options_box = QVBoxLayout()
-        self.log_scale_cb = QCheckBox("Log scale")
-        self.log_scale_cb.toggled.connect(self.update_plot)
-        options_box.addWidget(self.log_scale_cb)
-        self.normalize_ref_cb = QCheckBox("Normalize to reference group (fold change)")
-        self.normalize_ref_cb.toggled.connect(self.update_plot)
-        options_box.addWidget(self.normalize_ref_cb)
-
-        self.manual_yrange_cb = QCheckBox("Manual Y-axis range")
-        self.manual_yrange_cb.toggled.connect(self.update_plot)
-        options_box.addWidget(self.manual_yrange_cb)
-        yrange_row = QHBoxLayout()
-        yrange_row.addWidget(QLabel("Min:"))
-        self.y_min_spin = QDoubleSpinBox()
-        self.y_min_spin.setRange(-1e9, 1e9)
-        self.y_min_spin.setDecimals(3)
-        self.y_min_spin.valueChanged.connect(self.update_plot)
-        yrange_row.addWidget(self.y_min_spin)
-        yrange_row.addWidget(QLabel("Max:"))
-        self.y_max_spin = QDoubleSpinBox()
-        self.y_max_spin.setRange(-1e9, 1e9)
-        self.y_max_spin.setDecimals(3)
-        self.y_max_spin.setValue(100.0)
-        self.y_max_spin.valueChanged.connect(self.update_plot)
-        yrange_row.addWidget(self.y_max_spin)
-        options_box.addLayout(yrange_row)
-
-        options_box.addWidget(QLabel("Histogram bins (Stacked Histogram only):"))
+        # --- Style ---
+        style_scroll, f = form_page()
+        self.palette_selector = combo(self.update_plot)
+        self.palette_selector.addItems(PALETTE_NAMES)
+        f.addRow("Colours", self.palette_selector)
+        self.bw_mode_cb = check("Black && white (grey + hatching)")
+        self.bw_mode_cb.setToolTip("Grey shades with hatching / line styles, for print")
+        f.addRow("", self.bw_mode_cb)
+        self.dark_mode_cb = check("Dark mode", self.toggle_dark_theme)
+        f.addRow("", self.dark_mode_cb)
+        section(f, "Y axis")
+        self.log_scale_cb = check("Log scale")
+        f.addRow("", self.log_scale_cb)
+        self.normalize_ref_cb = check("Fold change vs reference group")
+        self.normalize_ref_cb.setToolTip("Divides by the mean of the 'Compare to' group (Stats tab)")
+        f.addRow("", self.normalize_ref_cb)
+        self.manual_yrange_cb = check("Fixed range")
+        self.manual_yrange_cb.toggled.connect(self._sync_control_visibility)
+        f.addRow("", self.manual_yrange_cb)
+        yr = QHBoxLayout()
+        self.y_min_spin = spin(-1e9, 1e9, 0.0)
+        self.y_max_spin = spin(-1e9, 1e9, 100.0)
+        yr.addWidget(self.y_min_spin)
+        yr.addWidget(QLabel("to"))
+        yr.addWidget(self.y_max_spin)
+        self._yrange_row = QWidget()
+        self._yrange_row.setLayout(yr)
+        yr.setContentsMargins(0, 0, 0, 0)
+        f.addRow("", self._yrange_row)
         self.hist_bins_spin = QSpinBox()
         self.hist_bins_spin.setRange(2, 200)
         self.hist_bins_spin.setValue(20)
         self.hist_bins_spin.valueChanged.connect(self.update_plot)
-        options_box.addWidget(self.hist_bins_spin)
+        self._bins_label = QLabel("Bins")
+        f.addRow(self._bins_label, self.hist_bins_spin)
+        section(f, "Labels")
+        lab_hint = QLabel("Click the title or an axis label on the graph to edit it.")
+        lab_hint.setObjectName("Hint")
+        lab_hint.setWordWrap(True)
+        f.addRow(lab_hint)
+        reset_labels_btn = QPushButton("Reset title and axis labels")
+        reset_labels_btn.clicked.connect(self.reset_custom_labels)
+        f.addRow(reset_labels_btn)
+        # axis break (Line plots)
+        self._break_section = QLabel("X-axis break (Line)")
+        self._break_section.setObjectName("Section")
+        f.addRow(self._break_section)
+        self.axis_break_cb = check("Split the X axis into two ranges")
+        f.addRow("", self.axis_break_cb)
+        self.axis_break_left_min = spin(-1e9, 1e9, 1.0, 2)
+        self.axis_break_left_max = spin(-1e9, 1e9, 2.0, 2)
+        self.axis_break_right_min = spin(-1e9, 1e9, 3.0, 2)
+        self.axis_break_right_max = spin(-1e9, 1e9, 4.0, 2)
+        self._break_rows = []
+        for label, a, b in (("Left", self.axis_break_left_min, self.axis_break_left_max),
+                            ("Right", self.axis_break_right_min, self.axis_break_right_max)):
+            row = QWidget()
+            hl = QHBoxLayout(row)
+            hl.setContentsMargins(0, 0, 0, 0)
+            hl.addWidget(a)
+            hl.addWidget(QLabel("to"))
+            hl.addWidget(b)
+            lab = QLabel(label)
+            f.addRow(lab, row)
+            self._break_rows += [lab, row]
+        self.control_tabs.addTab(style_scroll, "Style")
 
-        options_group.setLayout(options_box)
-        self.control_panel.addWidget(options_group)
+        # --- Stats ---
+        stats_scroll, f = form_page()
+        self.stat_mode_selector = combo(self.update_plot)
+        self.stat_mode_selector.addItems(StatisticsEngine.ALL_TESTS)
+        f.addRow("Test", self.stat_mode_selector)
+        self.reference_selector = combo(self.update_plot)
+        self.reference_selector.setToolTip("Compare every group with this one only "
+                                           "(Dunnett / Dunn vs control)")
+        f.addRow("Compare to", self.reference_selector)
+        self.pairing_selector = combo(self.update_plot)
+        self.pairing_selector.setToolTip("The column that matches samples across groups "
+                                         "(e.g. replicate ID)")
+        self._pairing_label = QLabel("Pair by")
+        f.addRow(self._pairing_label, self.pairing_selector)
+        self.show_pvalue_cb = check("Show p-values")
+        f.addRow("", self.show_pvalue_cb)
+        self.show_ns_cb = check("Show non-significant (ns)")
+        f.addRow("", self.show_ns_cb)
+        overlay_hint = QLabel("Stars use the same tests and corrections as the Statistical "
+                              "Analysis tab. With Color by, colours are compared within "
+                              "each X group.")
+        overlay_hint.setWordWrap(True)
+        overlay_hint.setObjectName("Hint")
+        f.addRow(overlay_hint)
+        run_btn = QPushButton("Open Full Report")
+        run_btn.setObjectName("primaryBtn")
+        run_btn.clicked.connect(self._run_stats_from_toolbar)
+        f.addRow(run_btn)
+        self.control_tabs.addTab(stats_scroll, "Stats")
 
-        # --- Axis break (gap) ---
-        axis_break_group = QGroupBox("X-Axis Break (Gap)")
-        axis_break_box = QVBoxLayout()
-        self.axis_break_cb = QCheckBox("Enable X-axis break")
-        self.axis_break_cb.setToolTip(
-            "Splits the plot into two side-by-side panels with a gap between them - "
-            "e.g. show 1->2, skip a gap, then show 3->4 - instead of one continuous axis. "
-            "Only applies to Line plots (a numeric, continuous X axis).")
-        self.axis_break_cb.toggled.connect(self.update_plot)
-        axis_break_box.addWidget(self.axis_break_cb)
+        for w in (self.chart_selector, self.stat_mode_selector):
+            w.currentTextChanged.connect(self._sync_control_visibility)
 
-        left_range_row = QHBoxLayout()
-        left_range_row.addWidget(QLabel("Left panel X range:"))
-        self.axis_break_left_min = QDoubleSpinBox()
-        self.axis_break_left_min.setRange(-1e9, 1e9)
-        self.axis_break_left_min.setValue(1.0)
-        self.axis_break_left_min.valueChanged.connect(self.update_plot)
-        left_range_row.addWidget(self.axis_break_left_min)
-        left_range_row.addWidget(QLabel("to"))
-        self.axis_break_left_max = QDoubleSpinBox()
-        self.axis_break_left_max.setRange(-1e9, 1e9)
-        self.axis_break_left_max.setValue(2.0)
-        self.axis_break_left_max.valueChanged.connect(self.update_plot)
-        left_range_row.addWidget(self.axis_break_left_max)
-        axis_break_box.addLayout(left_range_row)
-
-        right_range_row = QHBoxLayout()
-        right_range_row.addWidget(QLabel("Right panel X range:"))
-        self.axis_break_right_min = QDoubleSpinBox()
-        self.axis_break_right_min.setRange(-1e9, 1e9)
-        self.axis_break_right_min.setValue(3.0)
-        self.axis_break_right_min.valueChanged.connect(self.update_plot)
-        right_range_row.addWidget(self.axis_break_right_min)
-        right_range_row.addWidget(QLabel("to"))
-        self.axis_break_right_max = QDoubleSpinBox()
-        self.axis_break_right_max.setRange(-1e9, 1e9)
-        self.axis_break_right_max.setValue(4.0)
-        self.axis_break_right_max.valueChanged.connect(self.update_plot)
-        right_range_row.addWidget(self.axis_break_right_max)
-        axis_break_box.addLayout(right_range_row)
-
-        axis_break_group.setLayout(axis_break_box)
-        self.control_panel.addWidget(axis_break_group)
-
-        # --- Data Selection (per-value checkboxes, like Strains/Organism/Media) ---
-        data_selection_group = QGroupBox("Filter Values")
-        self.data_selection_layout = QVBoxLayout()
-        data_selection_group.setLayout(self.data_selection_layout)
-        self.control_panel.addWidget(data_selection_group)
-
-        self.plot_btn = QPushButton("Refresh Graph Layout")
-        self.plot_btn.setObjectName("primaryBtn")
-        self.plot_btn.clicked.connect(self.update_plot)
-        self.control_panel.addWidget(self.plot_btn)
-
-        self.control_panel.addWidget(QLabel("<br><b>Export Graphics:</b>"))
-        self.btn_export_png = QPushButton("Export Figure (PNG)")
-        self.btn_export_png.clicked.connect(lambda: self.export_current_plot("png"))
-        self.control_panel.addWidget(self.btn_export_png)
-        self.btn_export_svg = QPushButton("Export Graphic (SVG)")
-        self.btn_export_svg.clicked.connect(lambda: self.export_current_plot("svg"))
-        self.control_panel.addWidget(self.btn_export_svg)
-        self.control_panel.addStretch()
-
+        # Graph + Groups panel
         self.plot_figure = Figure(figsize=(6, 5), dpi=100)
         self.plot_canvas = FigureCanvas(self.plot_figure)
         self.plot_canvas.mpl_connect("pick_event", self.on_plot_pick)
         self.ax = self.plot_figure.add_subplot(111)
         self.axes = [self.ax]
         PlottingEngine.generate_plot(None, "", "", "", self.ax)
-        self.graph_layout.addWidget(control_scroll, stretch=1)
-        self.graph_layout.addWidget(self.plot_canvas, stretch=3)
+        canvas_card = QWidget()
+        canvas_card.setObjectName("Card")
+        cl = QVBoxLayout(canvas_card)
+        cl.setContentsMargins(8, 8, 8, 8)
+        cl.addWidget(self.plot_canvas)
+
+        self.groups_panel = GroupsPanel()
+        self.groups_panel.order_changed.connect(self._set_group_order)
+        self.groups_panel.series_order_changed.connect(self._set_series_order)
+        self.groups_panel.color_changed.connect(self._set_group_color)
+        self.groups_panel.colors_reset.connect(self.reset_group_colors)
+        self.groups_panel.order_reset.connect(self.reset_group_order)
+
+        self.graph_layout.setContentsMargins(10, 10, 10, 10)
+        self.graph_layout.setSpacing(10)
+        self.graph_layout.addWidget(self.control_tabs)
+        self.graph_layout.addWidget(canvas_card, stretch=1)
+        self.graph_layout.addWidget(self.groups_panel)
+        self._sync_control_visibility()
 
         # Tab 3: Analytics View
         self.analysis_tab = QWidget()
@@ -1053,6 +1007,9 @@ class BioStatExplorer(QMainWindow):
 
         self.dock.setWidget(dock_contents)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.dock)
+        # the Plotting Dashboard's "Show only" lists cover everyday filtering;
+        # this panel stays available under View
+        self.dock.hide()
         # Remembers each column's selected values so switching which column
         # you're looking at doesn't discard the filter you already set on
         # another column — {column_name: [selected value strings]}.
@@ -1156,6 +1113,7 @@ class BioStatExplorer(QMainWindow):
             self.dock_filter_selections = {}
             self.value_filter_list.clear()
             self.group_order = []
+            self.hue_order = []
             self.group_colors = {}
         self.display_data(self.filtered_df)
         self.metadata_col_list.clear()
@@ -1208,10 +1166,36 @@ class BioStatExplorer(QMainWindow):
         self.rebuild_reference_selector()
         self.update_plot()
 
-    def _update_chart_help_visibility(self, chart_type):
-        self.chart_help_label.setVisible(chart_type in ("Heatmap", "Volcano Plot", "Dendrogram", "Network Graph", "Stacked Bar"))
+    CHART_HELP = {
+        "Heatmap": "Rows = X groups; columns = Color by (or every metric if empty).",
+        "Volcano Plot": "X = log2 fold change column, Metric = p-value column; "
+                        "Color by labels the points.",
+        "Dendrogram": "Clusters the X groups using every numeric column.",
+        "Network Graph": "Correlations between all numeric columns.",
+        "Stacked Histogram": "Distribution of the Metric, stacked by Color by "
+                             "(or by X).",
+        "Stacked Bar": "Sum of the Metric per X group, stacked by Color by.",
+        "Line": "Mean ± SEM against a numeric X (time, concentration…).",
+    }
+
+    def _sync_control_visibility(self, *_):
+        """Show only the controls that apply to the chosen graph / test."""
+        chart = self.chart_selector.currentText()
+        help_text = self.CHART_HELP.get(chart, "")
+        self.chart_help_label.setText(help_text)
+        self.chart_help_label.setVisible(bool(help_text))
+        for w in [self._bins_label, self.hist_bins_spin]:
+            w.setVisible(chart == "Stacked Histogram")
+        for w in [self._break_section, self.axis_break_cb] + self._break_rows:
+            w.setVisible(chart == "Line")
+        paired = self.stat_mode_selector.currentText() in StatisticsEngine.PAIRED
+        self._pairing_label.setVisible(paired)
+        self.pairing_selector.setVisible(paired)
+        self._yrange_row.setEnabled(self.manual_yrange_cb.isChecked())
 
     def on_x_axis_changed(self):
+        if getattr(self, "_building", False):
+            return
         self.rebuild_hue_and_pairing_selectors()
         self.rebuild_reference_selector()
         self.update_plot()
@@ -1260,6 +1244,9 @@ class BioStatExplorer(QMainWindow):
                 item.setCheckState(Qt.CheckState.Checked)
                 lst.addItem(item)
             lst.itemChanged.connect(self.update_plot)
+            rows = min(lst.count(), 5)
+            lst.setFixedHeight(rows * 27 + 8)
+            v.setContentsMargins(6, 4, 6, 6)
             v.addWidget(lst)
             group.setLayout(v)
             self.data_selection_layout.addWidget(group)
@@ -1382,7 +1369,52 @@ class BioStatExplorer(QMainWindow):
 
     def reset_group_order(self):
         self.group_order = []
+        self.hue_order = []
         self.update_plot()
+
+    def _set_group_order(self, names):
+        self.group_order = list(names)
+        self.update_plot()
+
+    def _set_series_order(self, names):
+        self.hue_order = list(names)
+        self.update_plot()
+
+    def _set_group_color(self, name, color):
+        if color:
+            self.group_colors[name] = color
+        else:
+            self.group_colors.pop(name, None)
+        self.update_plot()
+
+    def _refresh_groups_panel(self, df, x_col, metric, hue_col, chart):
+        """Groups panel = what the graph shows, with the colours drawn."""
+        if df is None or df.empty or not x_col or x_col not in df.columns:
+            self.groups_panel.set_groups([])
+            return
+        x_groups = self._current_group_order()
+        series = None
+        if hue_col and hue_col in df.columns and hue_col != x_col:
+            levels = [str(v) for v in df[hue_col].dropna().unique()]
+            first = [h for h in self.hue_order if h in levels]
+            series = first + [h for h in levels if h not in first]
+            cats = series
+        elif chart == "Line":
+            cats = [metric]
+        else:
+            cats = x_groups
+        bw = self.bw_mode_cb.isChecked()
+        if bw:
+            n = max(len(cats), 1)
+            shades = np.linspace(0.75, 0.05, n) if n > 1 else [0.2]
+            colors = ["#%02x%02x%02x" % ((int(v * 255),) * 3) for v in shades]
+        else:
+            colors = palette_colors(self.palette_selector.currentText(), len(cats))
+        shown = {str(c): (colors[i] if bw else self.group_colors.get(str(c), colors[i]))
+                 for i, c in enumerate(cats)}
+        if chart == "Line" and not series:
+            series = [metric]
+        self.groups_panel.set_groups(x_groups, series, shown, self.group_colors)
 
     def reset_custom_labels(self):
         self.custom_titles = {}
@@ -1530,6 +1562,8 @@ class BioStatExplorer(QMainWindow):
         ax_right.plot([0], [1], transform=ax_right.transAxes, **break_kwargs)
 
     def update_plot(self):
+        if getattr(self, "_building", False):
+            return
         df = self.get_active_plot_df()
         x_col = self.x_selector.currentText()
         metrics = self.get_selected_metrics()
@@ -1596,7 +1630,7 @@ class BioStatExplorer(QMainWindow):
                 group_colors=self.group_colors, bw_mode=bw_mode, hist_bins=hist_bins,
                 custom_title=self.custom_titles.get(y_col), custom_xlabel=self.custom_xlabel,
                 custom_ylabel=self.custom_ylabels.get(y_col), group_order=self.group_order,
-                show_ns=self.show_ns_cb.isChecked(),
+                show_ns=self.show_ns_cb.isChecked(), hue_order=self.hue_order,
             )
 
             if use_axis_break:
@@ -1609,6 +1643,7 @@ class BioStatExplorer(QMainWindow):
 
         self.plot_figure.tight_layout()
         self.plot_canvas.draw()
+        self._refresh_groups_panel(df, x_col, metrics[0], hue_col, chart_type)
 
     def update_summary_table_view(self):
         df = self.get_active_plot_df()

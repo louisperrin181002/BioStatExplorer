@@ -1,6 +1,7 @@
 # src/plotting.py
 
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import seaborn as sns
 import pandas as pd
 import numpy as np
@@ -8,38 +9,67 @@ import scipy.stats as stats
 
 from src.statistics_engine import StatisticsEngine, stars, format_p
 
+# Colour sets offered in the UI (seaborn names work too)
+PALETTES = {
+    "Modern": ["#2563EB", "#F97316", "#10B981", "#E11D48", "#8B5CF6",
+               "#0EA5E9", "#EAB308", "#64748B", "#EC4899", "#14B8A6"],
+    "Colour-blind safe": ["#0072B2", "#E69F00", "#009E73", "#D55E00",
+                          "#CC79A7", "#56B4E9", "#F0E442", "#000000"],
+    "Nature": ["#E64B35", "#4DBBD5", "#00A087", "#3C5488", "#F39B7F",
+               "#8491B4", "#91D1C2", "#DC0000", "#7E6148", "#B09C85"],
+    "Soft": ["#7AA6DC", "#F2A97E", "#8CCB9B", "#E8879C", "#B39DDB",
+             "#80CBC4", "#F6D186", "#A3A9B5", "#F4A6C6", "#9ED2E6"],
+    "Bold": ["#1D4ED8", "#C2410C", "#047857", "#B91C1C", "#6D28D9",
+             "#0369A1", "#A16207", "#334155", "#BE185D", "#0F766E"],
+}
+PALETTE_NAMES = list(PALETTES) + ["muted", "deep", "pastel", "rocket", "crest"]
+
+
+def palette_colors(name, n):
+    """*n* colours from a named palette (cycled if needed)."""
+    n = max(n, 1)
+    if name in PALETTES:
+        base = PALETTES[name]
+        return [base[i % len(base)] for i in range(n)]
+    try:
+        return [mcolors.to_hex(c) for c in sns.color_palette(name, n_colors=n)]
+    except (ValueError, TypeError):
+        return palette_colors("Modern", n)
+
 
 class PlottingEngine:
     @staticmethod
-    def generate_plot(df, plot_type, x_col, y_col, ax, dark_mode=False, palette="muted",
+    def generate_plot(df, plot_type, x_col, y_col, ax, dark_mode=False, palette="Modern",
                        stat_mode="Auto (Prism Mode)", hue_col=None, log_scale=False,
                        reference=None, pairing_col=None, show_pvalue=False,
                        y_min=None, y_max=None, group_colors=None, bw_mode=False,
                        hist_bins=20, custom_title=None, custom_xlabel=None,
-                       custom_ylabel=None, group_order=None, show_ns=False):
+                       custom_ylabel=None, group_order=None, show_ns=False,
+                       hue_order=None):
         """Generates plots while respecting active application theme states and overlays stars."""
         ax.clear()
 
-        if dark_mode:
-            plt.style.use("dark_background")
-            ax.set_facecolor("#1E1E1E")
-            ax.figure.set_facecolor("#1E1E1E")
-            text_color = "#E0E0E0"
-            grid_color = "#333333"
-            line_color = "#AAAAAA"
-        else:
-            plt.style.use("default")
-            ax.set_facecolor("white")
-            ax.figure.set_facecolor("white")
-            text_color = "#2C3E50"
-            grid_color = "#E2E8F0"
-            line_color = "#444444"
+        from src.theme import plot_colors
+        pc = plot_colors(dark_mode)
+        plt.style.use("dark_background" if dark_mode else "default")
+        plt.rcParams.update({"font.family": ["Helvetica Neue", "Helvetica",
+                                             "Arial", "DejaVu Sans"],
+                             "axes.titleweight": "semibold",
+                             "axes.labelweight": "medium"})
+        ax.set_facecolor(pc["bg"])
+        ax.figure.set_facecolor(pc["bg"])
+        text_color = pc["text"]
+        grid_color = pc["grid"]
+        line_color = pc["line"]
 
         if df is None or df.empty or not x_col or not y_col:
             ax.text(0.5, 0.5, "Select X and Y variables to plot", ha='center', va='center', transform=ax.transAxes, color=text_color)
             return
 
-        ax.grid(True, linestyle="--", alpha=0.5, color=grid_color)
+        # light horizontal guide lines behind the data
+        ax.set_axisbelow(True)
+        ax.yaxis.grid(True, linestyle="-", linewidth=0.8, color=grid_color)
+        ax.xaxis.grid(False)
 
         # Keep an explicit categorical order for alignment
         unique_groups = list(df[x_col].dropna().unique())
@@ -67,6 +97,12 @@ class PlottingEngine:
         group_colors = group_colors or {}
         if hue_col:
             color_categories = list(df[hue_col].dropna().unique())
+            if hue_order:     # order chosen in the Groups panel
+                first = [h for h in color_categories
+                         if str(h) in [str(o) for o in hue_order]]
+                first.sort(key=lambda h: [str(o) for o in hue_order].index(str(h)))
+                color_categories = first + [h for h in color_categories
+                                            if h not in first]
         elif plot_type == "Line":
             # A single line (no Group/Color-By column) has no natural set of
             # "categories" to click-recolor - key it off y_col itself so the
@@ -83,7 +119,7 @@ class PlottingEngine:
             shades = np.linspace(0.75, 0.05, n) if n > 1 else np.array([0.2])
             default_colors = [(s, s, s) for s in shades]
         else:
-            default_colors = sns.color_palette(palette, n_colors=max(len(color_categories), 1))
+            default_colors = palette_colors(palette, len(color_categories))
         resolved_palette = [group_colors.get(str(cat), default_colors[i]) if not bw_mode
                              else default_colors[i]
                              for i, cat in enumerate(color_categories)]
@@ -111,9 +147,11 @@ class PlottingEngine:
         hue_order = color_categories
 
         if plot_type == "Bar":
-            PlottingEngine._draw_bar(df, x_col, y_col, ax, unique_groups, hue_col, resolved_palette, dark_mode, text_color, bw_mode)
+            PlottingEngine._draw_bar(df, x_col, y_col, ax, unique_groups, hue_col, resolved_palette, dark_mode, text_color, bw_mode,
+                                     hue_levels=color_categories if hue_col else None)
         elif plot_type == "Line":
-            PlottingEngine._draw_line(df, x_col, y_col, ax, hue_col, resolved_palette, text_color, bw_mode)
+            PlottingEngine._draw_line(df, x_col, y_col, ax, hue_col, resolved_palette, text_color, bw_mode,
+                                      hue_levels=color_categories if hue_col else None)
         elif plot_type == "Boxplot":
             sns.boxplot(data=df, x=x_col, y=y_col, hue=hue_col if hue_col else x_col, ax=ax,
                         palette=resolved_palette, width=0.5, order=unique_groups, hue_order=hue_order,
@@ -193,8 +231,8 @@ class PlottingEngine:
                     label.set_picker(True)
                     label.set_url("group_color:" + label.get_text())
 
-        # Style labels to match dark/light theme choices
-        sns.despine(ax=ax, left=True, bottom=True)
+        # Clean axes: left and bottom lines only
+        PlottingEngine._style_spines(ax, text_color)
 
         # Title / axis labels: each is picker-enabled with a distinct URL so
         # the UI can catch a click on it (same pick_event pathway used for
@@ -202,17 +240,17 @@ class PlottingEngine:
         # back to the auto-generated text until the user has customized it.
         default_title = f"{y_col} vs {x_col}" + (f" (by {hue_col})" if hue_col else "")
         title_obj = ax.set_title(custom_title if custom_title else default_title,
-                                  fontsize=14, fontweight='bold', pad=15, color=text_color)
+                                  fontsize=13, pad=14, color=text_color)
         title_obj.set_picker(True)
         title_obj.set_url(f"edit_title:{y_col}")
 
         xlabel_obj = ax.set_xlabel(custom_xlabel if custom_xlabel else x_col,
-                                    fontsize=12, fontweight='bold', color=text_color)
+                                    fontsize=11, color=text_color)
         xlabel_obj.set_picker(True)
         xlabel_obj.set_url("edit_xlabel")
 
         ylabel_obj = ax.set_ylabel(custom_ylabel if custom_ylabel else y_col,
-                                    fontsize=12, fontweight='bold', color=text_color)
+                                    fontsize=11, color=text_color)
         ylabel_obj.set_picker(True)
         ylabel_obj.set_url(f"edit_ylabel:{y_col}")
 
@@ -220,7 +258,7 @@ class PlottingEngine:
         if legend_needed and not is_line:
             handles, labels = ax.get_legend_handles_labels()
             if handles:
-                legend = ax.legend(title=hue_col, fontsize=8, title_fontsize=9)
+                legend = ax.legend(title=hue_col, fontsize=8.5, title_fontsize=9, frameon=False)
                 # Make each legend label clickable too, so hue-colored plots
                 # (color assigned by Group/Color-By) can also be recolored by
                 # clicking their legend entry instead of an x-tick label.
@@ -237,7 +275,18 @@ class PlottingEngine:
                         top=y_max if y_max is not None else cur_top)
 
     @staticmethod
-    def _draw_bar(df, x_col, y_col, ax, unique_groups, hue_col, palette, dark_mode, text_color, bw_mode=False):
+    def _style_spines(ax, color):
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_visible(True)
+            ax.spines[side].set_color(color)
+            ax.spines[side].set_linewidth(0.9)
+        ax.tick_params(length=3.5, width=0.8, colors=color)
+
+    @staticmethod
+    def _draw_bar(df, x_col, y_col, ax, unique_groups, hue_col, palette, dark_mode, text_color, bw_mode=False,
+                  hue_levels=None):
         """Grouped bar chart of mean +/- SEM, matching the classic Prism-style bar plot."""
         df_clean = df[[x_col, y_col] + ([hue_col] if hue_col else [])].dropna(subset=[x_col, y_col])
         df_clean[y_col] = pd.to_numeric(df_clean[y_col], errors='coerce')
@@ -248,7 +297,7 @@ class PlottingEngine:
         hatch_cycle = ["", "///", "...", "xxx", "\\\\\\", "+++", "ooo"]
 
         if hue_col:
-            hue_levels = list(df_clean[hue_col].dropna().unique())
+            hue_levels = hue_levels or list(df_clean[hue_col].dropna().unique())
             n_hues = len(hue_levels)
             bar_width = 0.8 / max(n_hues, 1)
             # `palette` here is already the resolved per-category color list built
@@ -266,9 +315,9 @@ class PlottingEngine:
                     sems.append(stats.sem(vals) if len(vals) > 1 else 0.0)
                     offset = (h_idx - (n_hues - 1) / 2.0) * bar_width
                     xs.append(g_idx + offset)
-                bars = ax.bar(xs, means, width=bar_width * 0.95, yerr=sems, capsize=3,
-                       color=colors[h_idx], label=str(h_level),
-                       edgecolor=text_color, linewidth=0.6, error_kw={"ecolor": text_color, "elinewidth": 1})
+                bars = ax.bar(xs, means, width=bar_width * 0.92, yerr=sems, capsize=3,
+                       color=colors[h_idx], label=str(h_level), linewidth=0,
+                       error_kw={"ecolor": text_color, "elinewidth": 1, "capthick": 1})
                 if bw_mode:
                     for b in bars:
                         b.set_hatch(hatch_cycle[h_idx % len(hatch_cycle)])
@@ -282,17 +331,19 @@ class PlottingEngine:
                 vals = df_clean[df_clean[x_col] == g][y_col].values
                 means.append(np.mean(vals) if len(vals) else 0.0)
                 sems.append(stats.sem(vals) if len(vals) > 1 else 0.0)
-            bars = ax.bar(range(len(unique_groups)), means, width=0.6, yerr=sems, capsize=3,
-                   color=colors, edgecolor=text_color, linewidth=0.6,
-                   error_kw={"ecolor": text_color, "elinewidth": 1})
+            bars = ax.bar(range(len(unique_groups)), means, width=0.62, yerr=sems, capsize=4,
+                   color=colors, linewidth=0,
+                   error_kw={"ecolor": text_color, "elinewidth": 1, "capthick": 1})
             if bw_mode:
                 for g_idx, b in enumerate(bars):
                     b.set_hatch(hatch_cycle[g_idx % len(hatch_cycle)])
 
         ax.set_xticks(range(len(unique_groups)))
+        if (df_clean[y_col] < 0).any():
+            ax.axhline(0, color=text_color, linewidth=0.8, zorder=1)
 
     @staticmethod
-    def _draw_line(df, x_col, y_col, ax, hue_col, palette, text_color, bw_mode=False):
+    def _draw_line(df, x_col, y_col, ax, hue_col, palette, text_color, bw_mode=False, hue_levels=None):
         """
         Connected mean +/- SEM line plot for continuous X data (e.g. a time
         course or substrate-concentration curve in an enzyme kinetics assay).
@@ -308,7 +359,7 @@ class PlottingEngine:
                      ha='center', va='center', transform=ax.transAxes, color=text_color, fontsize=10, wrap=True)
             return
 
-        hue_levels = list(df_clean[hue_col].dropna().unique()) if hue_col else [y_col]
+        hue_levels = (hue_levels or list(df_clean[hue_col].dropna().unique())) if hue_col else [y_col]
         # `palette` arrives pre-resolved from generate_plot (defaults, manual
         # click-to-recolor overrides, or B&W shades already applied) - use it
         # directly instead of re-deriving colors from the palette name.
@@ -335,7 +386,7 @@ class PlottingEngine:
 
         # Always show a legend for Line plots (even a single curve) so every
         # curve has a clickable target for manual recoloring.
-        legend = ax.legend(title=hue_col if hue_col else None, fontsize=8, title_fontsize=9)
+        legend = ax.legend(title=hue_col if hue_col else None, fontsize=8.5, title_fontsize=9, frameon=False)
         if legend:
             for text_obj, (line, lbl) in zip(legend.get_texts(), lines_for_legend):
                 text_obj.set_picker(True)
@@ -431,7 +482,7 @@ class PlottingEngine:
                         b.set_hatch(hatch_cycle[h_idx % len(hatch_cycle)])
                 bottoms = [b + h for b, h in zip(bottoms, heights)]
 
-            legend = ax.legend(title=hue_col, fontsize=8, title_fontsize=9)
+            legend = ax.legend(title=hue_col, fontsize=8.5, title_fontsize=9, frameon=False)
             if legend:
                 for text_obj, lbl in zip(legend.get_texts(), hue_levels):
                     text_obj.set_picker(True)
