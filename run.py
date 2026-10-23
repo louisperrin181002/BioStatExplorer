@@ -1780,7 +1780,40 @@ class BioStatExplorer(QMainWindow):
             self.status_bar.showMessage(f"{len(df)} rows saved: {path}", 6000)
 
 
+def selftest():
+    """Checks a built app: statistics, plate parsing and exports work."""
+    import tempfile
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    checks = {}
+    df = pd.DataFrame({"g": list("AAAABBBBCCCC"),
+                       "v": [1, 1.2, .9, 1.1, 1.6, 1.5, 1.9, 1.4, 1.2, 1.3, 1.25, 1.35],
+                       "rep": [1, 2, 3, 4] * 3})
+    SE = StatisticsEngine
+    checks["anova"] = abs(SE.compare(df, "g", "v", SE.ANOVA_TUKEY).omnibus_p - 0.00203) < 1e-3
+    checks["dunnett"] = len(SE.compare(df, "g", "v", SE.ANOVA_TUKEY, reference="A").comparisons) == 2
+    checks["dunn"] = len(SE.compare(df, "g", "v", SE.KRUSKAL_DUNN).comparisons) == 3
+    checks["rm_anova"] = SE.compare(df, "g", "v", SE.PAIRED_T, pairing_col="rep").omnibus_p is not None
+    grid = pd.DataFrame([[None, 1, 2, 3, 4], ["A", 1, 2, 3, 4], ["B", 5, 6, 7, 8]])
+    checks["plate"] = len(pr.find_plate_blocks(grid)) == 1
+    fig, ax = plt.subplots()
+    from src.plotting import PlottingEngine
+    PlottingEngine.generate_plot(df, "Box + Swarm", "g", "v", ax, stat_mode=SE.AUTO)
+    d = tempfile.mkdtemp()
+    for fmt in ("png", "svg", "pdf", "tiff"):
+        ExportEngine.save_figure_to(fig, os.path.join(d, "f." + fmt), fmt, dpi=100)
+    checks["export"] = all(os.path.getsize(os.path.join(d, "f." + f)) > 500
+                           for f in ("png", "svg", "pdf", "tiff"))
+    import openpyxl, reportlab, statsmodels  # noqa: F401  (bundled?)
+    ok = all(checks.values())
+    print(("selftest OK " if ok else "selftest FAILED ") + str(checks))
+    return 0 if ok else 1
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
     app = QApplication(sys.argv)
     window = BioStatExplorer()
     window.show()

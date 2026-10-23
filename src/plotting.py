@@ -175,8 +175,10 @@ class PlottingEngine:
                 dodge_width=PlottingEngine.DODGE_WIDTH.get(plot_type, 0.8),
                 show_ns=show_ns, bar_tops=bar_tops)
 
-        if not is_line:
+        numeric_x = plot_type == "Scatter" and pd.api.types.is_numeric_dtype(df[x_col])
+        if not is_line and not numeric_x:
             # Rotate labels 45 degrees, shrink font to size 10, and right-align them
+            ax.set_xticks(range(len(unique_groups)))
             ax.set_xticklabels(
                 [str(g) for g in unique_groups],
                 rotation=45,

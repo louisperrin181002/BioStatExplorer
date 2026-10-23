@@ -10,7 +10,9 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['PyQt5'],
+    # one Qt binding only (PySide6); skip big unused packages
+    excludes=['PyQt5', 'PyQt6', 'PySide2', 'tkinter', 'IPython', 'jupyter',
+              'notebook', 'sphinx', 'pytest', 'pingouin', 'scikit_posthocs'],
     noarchive=False,
     optimize=0,
 )
@@ -46,5 +48,7 @@ app = BUNDLE(
     coll,
     name='BioStatExplorer.app',
     icon=None,
-    bundle_identifier=None,
+    bundle_identifier='uk.ac.earlham.biostatexplorer',
+    info_plist={'CFBundleShortVersionString': '2.0.0',
+                'NSHighResolutionCapable': True},
 )
