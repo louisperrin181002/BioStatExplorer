@@ -2,29 +2,77 @@
 import sys
 import os
 import pandas as pd
-from PySide6.QtCore import Qt
+import html
+import numpy as np
+from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QSettings
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableWidget, QTableWidgetItem, QDockWidget, QFileDialog,
     QLabel, QStatusBar, QListWidget, QListWidgetItem, QComboBox, QTabWidget, QPushButton,
     QAbstractItemView, QTextEdit, QGroupBox, QDoubleSpinBox, QCheckBox, QScrollArea,
-    QSpinBox, QLineEdit, QInputDialog, QMessageBox, QGridLayout, QColorDialog, QMenu
+    QSpinBox, QLineEdit, QInputDialog, QMessageBox, QGridLayout, QColorDialog, QMenu,
+    QTableView, QToolBar, QToolButton, QDialog, QDialogButtonBox, QHeaderView
 )
 from PySide6.QtGui import QAction, QKeySequence, QColor, QCursor
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
-from src.excel_loader import DataLoader
+from src.excel_loader import DataLoader, sheet_names, read_grid
 from src.plotting import PlottingEngine
 from src.filters import FilterEngine
 from src.normalization import NormalizationEngine
-from src.statistics_engine import StatisticsEngine
+from src.statistics_engine import StatisticsEngine, format_p, stars
 from src.utils import SummaryStatistics
 from src.export_engine import ExportEngine
 from src.report_generator import PDFReportGenerator
 from src import plate_reader as pr
+from src import theme
 
 NO_SELECTION = "(none)"
+DATA_FILTER = "Data files (*.xlsx *.xlsm *.xls *.csv *.tsv *.txt)"
+DATA_EXT = (".xlsx", ".xlsm", ".xls", ".csv", ".tsv", ".txt")
+
+
+class PandasModel(QAbstractTableModel):
+    """Shows a DataFrame in a QTableView without copying it into one
+    widget per cell (fast for thousands of rows)."""
+
+    def __init__(self, df=None, parent=None):
+        super().__init__(parent)
+        self._df = df if df is not None else pd.DataFrame()
+
+    def set_frame(self, df):
+        self.beginResetModel()
+        self._df = df if df is not None else pd.DataFrame()
+        self.endResetModel()
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._df)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else self._df.shape[1]
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        v = self._df.iat[index.row(), index.column()]
+        if role == Qt.ItemDataRole.DisplayRole:
+            if v is None or (isinstance(v, float) and np.isnan(v)):
+                return ""
+            if isinstance(v, (float, np.floating)):
+                return f"{v:.6g}"
+            return str(v)
+        if role == Qt.ItemDataRole.TextAlignmentRole and isinstance(
+                v, (int, float, np.number)):
+            return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        return None
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
+        if orientation == Qt.Orientation.Horizontal:
+            return str(self._df.columns[section])
+        return str(section + 1)
 
 
 class PasteableTableWidget(QTableWidget):
@@ -154,30 +202,36 @@ class PlateGridEditor(QWidget):
                 self.table.item(r, c).setText("")
 
     def load_from_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Load Plate Grid", "", "Excel/CSV Files (*.xlsx *.xls *.csv)")
+        file_path, _ = QFileDialog.getOpenFileName(self, "Load Plate Grid", "", DATA_FILTER)
         if not file_path:
             return
         try:
-            if file_path.lower().endswith(".csv"):
-                raw = pd.read_csv(file_path, header=None)
-            else:
-                raw = pd.read_excel(file_path, header=None)
-            loc = pr.detect_plate_grid(raw)
-            if loc is None:
-                QMessageBox.warning(self, "Plate not found",
-                    "Could not auto-detect a plate layout (row letters beside column numbers) "
-                    "in this file. Please check the file or enter values manually.")
-                return
-            row_start, col_start, n_rows, n_cols = loc
-            self.set_shape(n_rows, n_cols)
-            block = raw.iloc[row_start:row_start + n_rows, col_start:col_start + n_cols].values
-            for r in range(n_rows):
-                for c in range(n_cols):
-                    v = block[r][c]
-                    text = "" if pd.isna(v) else str(v)
-                    self.table.item(r, c).setText(text)
+            blocks = pr.find_plate_blocks(read_grid(file_path))
         except Exception as e:
             QMessageBox.warning(self, "Load failed", f"Could not read this file: {e}")
+            return
+        if not blocks:
+            QMessageBox.warning(self, "Plate not found",
+                "Could not find a plate layout (row letters beside column numbers) "
+                "in this file. Please check the file or enter values manually.")
+            return
+        block = blocks[0]
+        if len(blocks) > 1:
+            titles = [f"{b['title']}  ({b['n_rows']}×{b['n_cols']})" for b in blocks]
+            choice, ok = QInputDialog.getItem(self, "Choose Grid",
+                                              "This file has several plate grids:",
+                                              titles, 0, False)
+            if not ok:
+                return
+            block = blocks[titles.index(choice)]
+        self.set_shape(max(self.n_rows, block["n_rows"]), max(self.n_cols, block["n_cols"]))
+        self.set_cells(block["cells"])
+
+    def set_cells(self, cells):
+        """Fill the grid from a 2-D list of text (an imported plate block)."""
+        for r in range(min(self.n_rows, len(cells))):
+            for c in range(min(self.n_cols, len(cells[r]))):
+                self.table.item(r, c).setText(cells[r][c])
 
     def get_grid_values(self):
         grid = []
@@ -190,6 +244,99 @@ class PlateGridEditor(QWidget):
         return grid
 
 
+def suggest_readout_name(title):
+    """'Raw Data (485-15/528-20 1)' -> 'GFP (485/528)', '(600)' -> 'OD600'."""
+    import re
+    m = re.search(r"\((\d{3})(?:-\d+)?/(\d{3})", title)
+    norm = " / OD" if re.search(r"normali", title, re.I) else ""
+    if m:
+        ex, em = int(m.group(1)), int(m.group(2))
+        name = ("GFP" if 470 <= ex <= 500 and 500 <= em <= 545 else
+                "mKate" if 560 <= ex <= 600 and em >= 610 else
+                "RFP" if 540 <= ex <= 590 and em >= 590 else
+                "BFP" if ex < 420 else f"Ex{ex}")
+        return f"{name}{norm} ({ex}/{em})"
+    m = re.search(r"\((\d{3})\)", title)
+    if m:
+        return f"OD{m.group(1)}{norm}"
+    return title
+
+
+class PlateImportDialog(QDialog):
+    """Pick which grids of a plate-reader export to import, name them, and
+    say whether each is a readout or a plate map."""
+
+    KINDS = ["Readout (numbers)", "Plate map (labels)"]
+
+    def __init__(self, blocks, path, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Import Plate-Reader File")
+        self.resize(820, 360)
+        self.blocks = blocks
+        lay = QVBoxLayout(self)
+        head = QLabel(f"<b>{len(blocks)} plate grid{'s' if len(blocks) != 1 else ''}</b> "
+                      f"found in {html.escape(os.path.basename(path))}. Tick the ones to "
+                      "import and give each a short name (it becomes a column).")
+        head.setWordWrap(True)
+        lay.addWidget(head)
+        self.table = QTableWidget(len(blocks), 5)
+        self.table.setHorizontalHeaderLabels(["Import", "Name", "Type", "Size", "Check"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        for i, b in enumerate(blocks):
+            chk = QTableWidgetItem()
+            chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            chk.setCheckState(Qt.CheckState.Checked)
+            self.table.setItem(i, 0, chk)
+            name = QTableWidgetItem(b["title"] if b["is_map"] else
+                                    suggest_readout_name(b["title"]))
+            name.setToolTip(f"In the file: {b['title']}")
+            self.table.setItem(i, 1, name)
+            kind = QComboBox()
+            kind.addItems(self.KINDS)
+            kind.setCurrentIndex(1 if b["is_map"] else 0)
+            self.table.setCellWidget(i, 2, kind)
+            size = QTableWidgetItem(f"{b['n_rows']} × {b['n_cols']}")
+            size.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.table.setItem(i, 3, size)
+            notes = []
+            if b["saturated"]:
+                top = max(v for row in b["values"] for v in row if v is not None)
+                notes.append(f"⚠ {b['saturated']} wells at the maximum ({top:g}) — "
+                             "detector probably saturated")
+            if b["overflow"]:
+                notes.append(f"⚠ {b['overflow']} overflow cells (left empty)")
+            note = QTableWidgetItem("; ".join(notes) or "OK")
+            note.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            if notes:
+                note.setForeground(QColor("#B45309"))
+            self.table.setItem(i, 4, note)
+        self.table.resizeColumnsToContents()
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        lay.addWidget(self.table, 1)
+        hint = QLabel("Then add a plate map (what is in each well — strain, medium…) "
+                      "and press Build Dataset From Plate.")
+        hint.setObjectName("Hint")
+        lay.addWidget(hint)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                              QDialogButtonBox.StandardButton.Cancel)
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("Import")
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def chosen(self):
+        """[(block, name, is_map)] for the ticked rows."""
+        out = []
+        for i, b in enumerate(self.blocks):
+            if self.table.item(i, 0).checkState() != Qt.CheckState.Checked:
+                continue
+            name = self.table.item(i, 1).text().strip() or b["title"]
+            out.append((b, name, self.table.cellWidget(i, 2).currentIndex() == 1))
+        return out
+
+
 class DropZoneWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -197,7 +344,8 @@ class DropZoneWidget(QWidget):
         self.init_ui()
     def init_ui(self):
         layout = QVBoxLayout()
-        self.label = QLabel("Drag & Drop Excel or CSV files here\n- or -\nUse File > Open")
+        self.label = QLabel("Drop Excel or CSV files here\n\nor use Open Data… (⌘O)\n\n"
+                            "Plate-reader exports: Import Plate… (⇧⌘I)")
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.label.setObjectName("dropLabel")
         layout.addWidget(self.label)
@@ -206,7 +354,8 @@ class DropZoneWidget(QWidget):
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls(): event.acceptProposedAction()
     def dropEvent(self, event):
-        paths = [url.toLocalFile() for url in event.mimeData().urls() if url.toLocalFile().endswith(('.xlsx', '.xls', '.csv'))]
+        paths = [url.toLocalFile() for url in event.mimeData().urls()
+                 if url.toLocalFile().lower().endswith(DATA_EXT)]
         if paths: self.parent_window.process_files(paths)
 
 
@@ -243,21 +392,82 @@ class BioStatExplorer(QMainWindow):
         self.metadata_cols = []
         self.metadata_checklists = {}   # {column_name: QListWidget}
 
-        self.init_menu()
         self.init_central_widget()
         self.init_dock_panels()
+        self.init_menu()
         self.apply_theme()
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready")
 
+    def _action(self, menu, text, slot, shortcut=None, tip=None):
+        act = QAction(text, self)
+        act.triggered.connect(slot)
+        if shortcut:
+            act.setShortcut(QKeySequence(shortcut))
+        if tip:
+            act.setToolTip(tip)
+        menu.addAction(act)
+        return act
+
     def init_menu(self):
         menu_bar = self.menuBar()
         file_menu = menu_bar.addMenu("&File")
-        open_action = QAction("&Open File(s)", self)
-        open_action.triggered.connect(self.open_file_dialog)
-        file_menu.addAction(open_action)
+        self._action(file_menu, "Open Data…", self.open_file_dialog,
+                     QKeySequence.StandardKey.Open)
+        self._action(file_menu, "Add Data (append)…",
+                     lambda: self.open_file_dialog(append=True))
+        self._action(file_menu, "Import Plate-Reader File…",
+                     self.import_plate_file, "Ctrl+Shift+I")
+        file_menu.addSeparator()
+        self.export_menu = file_menu.addMenu("Export")
+        self._action(self.export_menu, "Figure (PNG, 600 dpi)…",
+                     lambda: self.export_current_plot("png"), "Ctrl+Shift+E")
+        self._action(self.export_menu, "Figure (SVG — editable in Inkscape)…",
+                     lambda: self.export_current_plot("svg"))
+        self._action(self.export_menu, "Figure (PDF)…",
+                     lambda: self.export_current_plot("pdf"))
+        self._action(self.export_menu, "Figure (TIFF, 600 dpi)…",
+                     lambda: self.export_current_plot("tiff"))
+        self.export_menu.addSeparator()
+        self._action(self.export_menu, "Statistics (Excel)…",
+                     self.export_stats_data, "Ctrl+E")
+        self._action(self.export_menu, "PDF Report…", self.export_pdf_report)
+        self._action(self.export_menu, "Data Table (CSV)…", self.export_data_csv)
+        file_menu.addSeparator()
+        self._action(file_menu, "Quit", self.close, QKeySequence.StandardKey.Quit)
+
+        view_menu = menu_bar.addMenu("&View")
+        self.dark_action = QAction("Dark Mode", self, checkable=True)
+        self.dark_action.toggled.connect(self.toggle_dark_theme)
+        view_menu.addAction(self.dark_action)
+        view_menu.addAction(self.dock.toggleViewAction() if hasattr(self, "dock")
+                            else QAction("Filters", self))
+
+        tb = QToolBar("Main")
+        tb.setMovable(False)
+        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.addToolBar(tb)
+        brand = QLabel("  BioStat Explorer   ")
+        brand.setObjectName("Title")
+        tb.addWidget(brand)
+        open_btn = QToolButton()
+        open_btn.setText("＋ Open Data")
+        open_btn.setObjectName("Primary")
+        open_btn.clicked.connect(self.open_file_dialog)
+        tb.addWidget(open_btn)
+        for text, slot in (("Import Plate", self.import_plate_file),
+                           ("Run Statistics", self._run_stats_from_toolbar)):
+            b = QToolButton()
+            b.setText(text)
+            b.clicked.connect(slot)
+            tb.addWidget(b)
+        exp = QToolButton()
+        exp.setText("Export ▾")
+        exp.setMenu(self.export_menu)
+        exp.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        tb.addWidget(exp)
 
     def init_central_widget(self):
         self.tabs = QTabWidget()
@@ -266,7 +476,13 @@ class BioStatExplorer(QMainWindow):
         self.data_tab = QWidget()
         self.data_layout = QVBoxLayout(self.data_tab)
         self.drop_zone = DropZoneWidget(self)
-        self.table_viewer = QTableWidget()
+        self.table_model = PandasModel()
+        self.table_viewer = QTableView()
+        self.table_viewer.setModel(self.table_model)
+        self.table_viewer.setAlternatingRowColors(True)
+        self.table_viewer.setSortingEnabled(False)
+        self.table_viewer.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Interactive)
         self.table_viewer.hide()
         self.data_layout.addWidget(self.drop_zone)
         self.data_layout.addWidget(self.table_viewer)
@@ -277,12 +493,14 @@ class BioStatExplorer(QMainWindow):
 
         control_scroll = QScrollArea()
         control_scroll.setWidgetResizable(True)
+        control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        control_scroll.setMinimumWidth(330)
         control_host = QWidget()
         self.control_panel = QVBoxLayout(control_host)
         control_scroll.setWidget(control_host)
 
         # --- Styling ---
-        style_group = QGroupBox("UI & Plot Styling")
+        style_group = QGroupBox("Look")
         style_box = QVBoxLayout()
         self.dark_mode_cb = QCheckBox("Enable Dark Mode")
         self.dark_mode_cb.toggled.connect(self.toggle_dark_theme)
@@ -294,7 +512,7 @@ class BioStatExplorer(QMainWindow):
         self.palette_selector.currentTextChanged.connect(self.update_plot)
         style_box.addWidget(self.palette_selector)
 
-        self.bw_mode_cb = QCheckBox("Black & white mode (grayscale + hatch/linestyle)")
+        self.bw_mode_cb = QCheckBox("Black && white (grey + hatching)")
         self.bw_mode_cb.setToolTip(
             "Overrides colors with grayscale shades, and adds hatch patterns "
             "(bars/histograms) or distinct line styles/markers (line plots) "
@@ -396,6 +614,15 @@ class BioStatExplorer(QMainWindow):
         self.show_pvalue_cb = QCheckBox("Show p-values on plot")
         self.show_pvalue_cb.toggled.connect(self.update_plot)
         stats_overlay_box.addWidget(self.show_pvalue_cb)
+        self.show_ns_cb = QCheckBox("Also show non-significant (ns)")
+        self.show_ns_cb.toggled.connect(self.update_plot)
+        stats_overlay_box.addWidget(self.show_ns_cb)
+        overlay_hint = QLabel("Stars use the same tests and corrections as the "
+                              "Statistical Analysis tab. With a Group / Color By "
+                              "column, colours are compared within each X group.")
+        overlay_hint.setWordWrap(True)
+        overlay_hint.setObjectName("Hint")
+        stats_overlay_box.addWidget(overlay_hint)
 
         stats_overlay_group.setLayout(stats_overlay_box)
         self.control_panel.addWidget(stats_overlay_group)
@@ -532,18 +759,18 @@ class BioStatExplorer(QMainWindow):
         norm_group.setLayout(norm_box)
         analysis_controls.addWidget(norm_group)
 
-        stat_group = QGroupBox("Prism Inference Core")
+        stat_group = QGroupBox("Statistics")
         stat_box = QVBoxLayout()
         self.btn_run_stats = QPushButton("Run Statistical Test")
         self.btn_run_stats.setObjectName("successBtn")
         self.btn_run_stats.clicked.connect(self.run_statistical_pipeline)
         stat_box.addWidget(self.btn_run_stats)
 
-        self.btn_export_stats = QPushButton("Export Summary (Excel)")
+        self.btn_export_stats = QPushButton("Export to Excel…")
         self.btn_export_stats.clicked.connect(self.export_stats_data)
         stat_box.addWidget(self.btn_export_stats)
 
-        self.btn_export_pdf = QPushButton("Compile PDF Report")
+        self.btn_export_pdf = QPushButton("PDF Report…")
         self.btn_export_pdf.setObjectName("dangerBtn")
         self.btn_export_pdf.clicked.connect(self.export_pdf_report)
         stat_box.addWidget(self.btn_export_pdf)
@@ -557,7 +784,7 @@ class BioStatExplorer(QMainWindow):
         self.summary_table_view = QTableWidget()
         right_analysis_layout.addWidget(self.summary_table_view, stretch=1)
 
-        right_analysis_layout.addWidget(QLabel("<b>Statistical Inference Matrix:</b>"))
+        right_analysis_layout.addWidget(QLabel("<b>Report</b> — test, post-hoc comparisons, effect sizes"))
         self.stats_output = QTextEdit()
         self.stats_output.setReadOnly(True)
         right_analysis_layout.addWidget(self.stats_output, stretch=2)
@@ -584,6 +811,12 @@ class BioStatExplorer(QMainWindow):
         self.plate_size_selector.setCurrentText("96-well (8x12)")
         self.plate_size_selector.currentTextChanged.connect(self.on_plate_size_changed)
         top_bar.addWidget(self.plate_size_selector)
+        import_btn = QPushButton("Import Plate-Reader File…")
+        import_btn.setObjectName("primaryBtn")
+        import_btn.setToolTip("Reads every plate grid in an instrument export (e.g. BMG "
+                              "CLARIOstar: GFP, mKate, OD, normalised) — or a plate map")
+        import_btn.clicked.connect(self.import_plate_file)
+        top_bar.addWidget(import_btn)
         top_bar.addStretch()
         outer_layout.addLayout(top_bar)
 
@@ -704,6 +937,57 @@ class BioStatExplorer(QMainWindow):
         self.map_layers_tabs.removeTab(idx)
         self.map_layer_editors.pop(name, None)
 
+    @staticmethod
+    def _grid_is_empty(editor):
+        return all(not v.strip() for row in editor.get_grid_values() for v in row)
+
+    def import_plate_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import Plate-Reader File",
+                                              self._last_dir(), DATA_FILTER)
+        if not path:
+            return
+        self._remember_dir(path)
+        sheet, ok = self._choose_sheet(path, "plate grids")
+        if not ok:
+            return
+        try:
+            blocks = pr.find_plate_blocks(read_grid(path, sheet))
+        except Exception as e:
+            QMessageBox.warning(self, "Could not read", str(e))
+            return
+        if not blocks:
+            QMessageBox.information(
+                self, "No plate grid found",
+                "No plate-shaped grid (column numbers 1, 2, 3… with row letters A, B, "
+                "C… beside them) was found. If this file is a plain table (one row "
+                "per sample), use Open Data instead.")
+            return
+        dlg = PlateImportDialog(blocks, path, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        chosen = dlg.chosen()
+        if not chosen:
+            return
+        shape = pr.shape_name(max(b["n_rows"] for b, _, _ in chosen),
+                              max(b["n_cols"] for b, _, _ in chosen))
+        if shape != self.plate_size_selector.currentText():
+            self.plate_size_selector.setCurrentText(shape)
+        for block, name, is_map in chosen:
+            editors = self.map_layer_editors if is_map else self.value_layer_editors
+            tabs = self.map_layers_tabs if is_map else self.value_layers_tabs
+            # an untouched default grid makes way for the imported ones
+            for old in [n for n, e in editors.items() if n in ("Value", "Strain")
+                        and n != name and self._grid_is_empty(e)]:
+                tabs.removeTab(tabs.indexOf(editors.pop(old)))
+            editor = editors.get(name) or self._new_plate_grid_tab(tabs, editors, name)
+            editor.set_cells(block["cells"])
+            tabs.setCurrentWidget(editor)
+        self.tabs.setCurrentWidget(self.plate_tab)
+        warn = [f"{n}: {b['saturated']} saturated wells" for b, n, _ in chosen if b["saturated"]]
+        self.status_bar.showMessage(
+            f"Imported {len(chosen)} grid(s) from {os.path.basename(path)}"
+            + (" — " + "; ".join(warn) if warn else ""), 10000)
+
     def build_dataset_from_plate(self):
         n_rows, n_cols = pr.PLATE_SHAPES[self.plate_size_selector.currentText()]
 
@@ -732,6 +1016,8 @@ class BioStatExplorer(QMainWindow):
             layer_dfs.append(pr.map_grid_to_long(grid, name, n_rows, n_cols))
 
         merged = pr.merge_well_layers(merged_values, layer_dfs)
+        # empty wells (no reading at all) aren't samples
+        merged = merged.dropna(subset=metric_names, how="all").reset_index(drop=True)
 
         append = False
         if self.master_df is not None:
@@ -748,7 +1034,7 @@ class BioStatExplorer(QMainWindow):
         self.tabs.setCurrentWidget(self.graph_tab)
 
     def init_dock_panels(self):
-        self.dock = QDockWidget("Data Slicing Engine", self)
+        self.dock = QDockWidget("Filters", self)
         dock_contents = QWidget()
         dock_layout = QVBoxLayout(dock_contents)
         dock_layout.addWidget(QLabel("<b>1. Select Metadata Column:</b>"))
@@ -773,53 +1059,71 @@ class BioStatExplorer(QMainWindow):
         self.dock_filter_selections = {}
 
     def apply_theme(self):
-        if self.is_dark_mode:
-            self.setStyleSheet("""
-                QMainWindow, QWidget { background-color: #1E1E1E; color: #E0E0E0; font-family: 'Segoe UI', Arial; }
-                QTableWidget { background-color: #2D2D2D; gridline-color: #3F3F3F; color: #E0E0E0; }
-                QHeaderView::section { background-color: #3A3A3A; color: #E0E0E0; border: 1px solid #2D2D2D; }
-                QComboBox, QDoubleSpinBox, QTextEdit, QListWidget { background-color: #2D2D2D; border: 1px solid #444; color: #E0E0E0; border-radius: 4px; padding: 4px; }
-                QPushButton { background-color: #3D3D3D; border: 1px solid #555; color: #E0E0E0; border-radius: 4px; padding: 6px; }
-                QPushButton:hover { background-color: #4D4D4D; }
-                QGroupBox { border: 1px solid #444; border-radius: 6px; margin-top: 12px; font-weight: bold; }
-                QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 3px; }
-                #dropLabel { border: 2px dashed #4A90E2; border-radius: 8px; background-color: #252830; color: #A0A5B0; font-size: 14px; }
-                #primaryBtn { background-color: #2980B9; color: white; font-weight: bold; }
-                #successBtn { background-color: #27AE60; color: white; font-weight: bold; }
-                #dangerBtn { background-color: #C0392B; color: white; font-weight: bold; }
-            """)
-        else:
-            self.setStyleSheet("""
-                QMainWindow, QWidget { background-color: #FAFAFA; color: #2C3E50; font-family: 'Segoe UI', Arial; }
-                QTableWidget { background-color: white; gridline-color: #E2E8F0; color: #2C3E50; }
-                QHeaderView::section { background-color: #F1F5F9; color: #475569; border: 1px solid #E2E8F0; }
-                QComboBox, QDoubleSpinBox, QTextEdit, QListWidget { background-color: white; border: 1px solid #CBD5E1; color: #2C3E50; border-radius: 4px; padding: 4px; }
-                QPushButton { background-color: #F1F5F9; border: 1px solid #CBD5E1; color: #475569; border-radius: 4px; padding: 6px; }
-                QPushButton:hover { background-color: #E2E8F0; }
-                QGroupBox { border: 1px solid #E2E8F0; border-radius: 6px; margin-top: 12px; font-weight: bold; }
-                QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 3px; }
-                #dropLabel { border: 2px dashed #4A90E2; border-radius: 8px; background-color: #F0F4F8; color: #333333; font-size: 14px; }
-                #primaryBtn { background-color: #4A90E2; color: white; font-weight: bold; }
-                #successBtn { background-color: #2ECC71; color: white; font-weight: bold; }
-                #dangerBtn { background-color: #E74C3C; color: white; font-weight: bold; }
-            """)
+        self.setStyleSheet(theme.stylesheet(self.is_dark_mode))
 
     def toggle_dark_theme(self, checked):
         self.is_dark_mode = checked
+        for w in (getattr(self, "dark_mode_cb", None), getattr(self, "dark_action", None)):
+            if w is not None and w.isChecked() != checked:
+                w.blockSignals(True)
+                w.setChecked(checked)
+                w.blockSignals(False)
         self.apply_theme()
         self.update_plot()
 
-    def open_file_dialog(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "Open Data File(s)", "", "Excel/CSV Files (*.xlsx *.xls *.csv)")
-        if files: self.process_files(files)
+    def open_file_dialog(self, append=False):
+        files, _ = QFileDialog.getOpenFileNames(self, "Open Data File(s)",
+                                                self._last_dir(), DATA_FILTER)
+        if files:
+            self._remember_dir(files[0])
+            self.process_files(files, append=bool(append))
 
-    def process_files(self, file_paths):
+    def _last_dir(self):
+        return QSettings("BioStatExplorer", "BioStatExplorer").value("last_dir", "")
+
+    def _remember_dir(self, path):
+        QSettings("BioStatExplorer", "BioStatExplorer").setValue(
+            "last_dir", os.path.dirname(path))
+
+    def _choose_sheet(self, path, purpose="data"):
+        """The sheet to read: asks when an Excel file has several."""
         try:
-            df, recognized, metadata = self.data_loader.load_and_merge(file_paths)
-            if df.empty: return
-            self.recognized_cols = recognized
-            self.ingest_dataframe(df, append=False)
-        except Exception as e: self.status_bar.showMessage(f"Engine Error: {str(e)}", 5000)
+            names = sheet_names(path)
+        except Exception:
+            return None, True
+        if len(names) <= 1:
+            return (names[0] if names else None), True
+        name, ok = QInputDialog.getItem(
+            self, "Choose Sheet",
+            f"{os.path.basename(path)} has {len(names)} sheets.\n"
+            f"Which one holds the {purpose}?", names, 0, False)
+        return name, ok
+
+    def process_files(self, file_paths, append=False):
+        sheets = {}
+        for path in file_paths:
+            sheet, ok = self._choose_sheet(path)
+            if not ok:
+                return
+            if sheet:
+                sheets[path] = sheet
+        try:
+            df, numeric, other, reports = self.data_loader.load_and_merge(
+                file_paths, sheets)
+        except Exception as e:
+            QMessageBox.warning(self, "Could not open", str(e))
+            return
+        notes = [str(r) for r in reports if r.notes]
+        if df.empty:
+            QMessageBox.warning(self, "No data found",
+                                "No table was found in:\n" + "\n".join(
+                                    os.path.basename(p) for p in file_paths)
+                                + ("\n\n" + "\n".join(notes) if notes else ""))
+            return
+        self.recognized_cols = numeric
+        self.ingest_dataframe(df, append=append)
+        if notes:
+            self.status_bar.showMessage("Loaded — " + " | ".join(notes), 12000)
 
     def ingest_dataframe(self, df, append=False, source_label=None):
         """
@@ -842,27 +1146,48 @@ class BioStatExplorer(QMainWindow):
         self.master_df = combined.copy()
         self.filtered_df = combined.copy()
         # Classify by actual dtype: any numeric column is a plottable metric,
-        # everything else (including recognized-but-categorical columns like
-        # "Organism"/"Medium") is filterable metadata. This matters because
-        # column_detection's "recognized" list mixes numeric signal columns
-        # (GFP, mKate) together with categorical labels (Organism, Medium) —
-        # only the former should be excluded from the filter checklists.
+        # everything else (Strain, Medium, Well...) is filterable metadata.
         self.metric_cols = [c for c in combined.columns if pd.api.types.is_numeric_dtype(combined[c])]
         self.metadata_cols = [c for c in combined.columns if c not in self.metric_cols]
         if "Source File" not in self.metadata_cols and "Source File" in combined.columns:
             self.metadata_cols.append("Source File")
+        if not append:
+            # a new dataset: forget the previous one's filters and labels
+            self.dock_filter_selections = {}
+            self.value_filter_list.clear()
+            self.group_order = []
+            self.group_colors = {}
         self.display_data(self.filtered_df)
-        self.update_selectors()
         self.metadata_col_list.clear()
         self.metadata_col_list.addItems(self.metadata_cols)
-        self.rebuild_data_selection_panel()
+        self.rebuild_data_selection_panel()      # before plotting with it
+        self.update_selectors(choose_defaults=not append)
         self.status_bar.showMessage(f"Loaded {combined.shape[0]} rows, {combined.shape[1]} columns.", 4000)
 
     # ---------------------------------------------------------------
     # Selector population
     # ---------------------------------------------------------------
-    def update_selectors(self):
+    def _default_x(self):
+        """A column that groups the rows: text, 2-50 distinct values, not an
+        ID (well, file, replicate)."""
+        df = self.master_df
+        skip = {"Well", "Row", "Column", "Source File"}
+        best = None
+        for c in self.metadata_cols:
+            if c in skip:
+                continue
+            n = df[c].nunique()
+            if 2 <= n <= 50 and n < len(df):
+                if best is None:
+                    best = c
+                # a column where every group has replicates is the best guess
+                if df[c].value_counts().min() >= 2:
+                    return c
+        return best
+
+    def update_selectors(self, choose_defaults=False):
         cols = list(self.filtered_df.columns) if self.filtered_df is not None else []
+        old_x, old_y = self.x_selector.currentText(), self.y_selector.currentText()
         self.x_selector.blockSignals(True)
         self.y_selector.blockSignals(True)
         self.x_selector.clear()
@@ -871,6 +1196,12 @@ class BioStatExplorer(QMainWindow):
         # Prefer numeric metric columns for the Metric dropdown, if any exist
         metric_candidates = [c for c in getattr(self, 'metric_cols', []) if c in cols] or cols
         self.y_selector.addItems(metric_candidates)
+        x = old_x if (old_x in cols and not choose_defaults) else (
+            self._default_x() if self.master_df is not None else None)
+        if x:
+            self.x_selector.setCurrentText(x)
+        if old_y in metric_candidates and not choose_defaults:
+            self.y_selector.setCurrentText(old_y)
         self.x_selector.blockSignals(False)
         self.y_selector.blockSignals(False)
         self.rebuild_hue_and_pairing_selectors()
@@ -1038,15 +1369,9 @@ class BioStatExplorer(QMainWindow):
         if df is None: return
         self.drop_zone.hide()
         self.table_viewer.show()
-        self.table_viewer.setRowCount(df.shape[0])
-        self.table_viewer.setColumnCount(df.shape[1])
-        self.table_viewer.setHorizontalHeaderLabels(df.columns.astype(str))
-        for row_idx in range(df.shape[0]):
-            for col_idx in range(df.shape[1]):
-                val = df.iat[row_idx, col_idx]
-                item = QTableWidgetItem(str(val) if pd.notna(val) else "")
-                self.table_viewer.setItem(row_idx, col_idx, item)
-        self.table_viewer.resizeColumnsToContents()
+        self.table_model.set_frame(df)
+        if len(df) <= 2000:
+            self.table_viewer.resizeColumnsToContents()
 
     # ---------------------------------------------------------------
     # Plotting
@@ -1271,6 +1596,7 @@ class BioStatExplorer(QMainWindow):
                 group_colors=self.group_colors, bw_mode=bw_mode, hist_bins=hist_bins,
                 custom_title=self.custom_titles.get(y_col), custom_xlabel=self.custom_xlabel,
                 custom_ylabel=self.custom_ylabels.get(y_col), group_order=self.group_order,
+                show_ns=self.show_ns_cb.isChecked(),
             )
 
             if use_axis_break:
@@ -1290,7 +1616,8 @@ class BioStatExplorer(QMainWindow):
         metrics = self.get_selected_metrics()
         y_var = metrics[0] if metrics else None
         if not x_var or not y_var or df is None: return
-        self.current_summary_df = SummaryStatistics.generate_table(df, x_var, y_var)
+        self.current_summary_df = SummaryStatistics.generate_table(
+            df, x_var, y_var, order=self._current_group_order())
         if self.current_summary_df.empty: return
         self.summary_table_view.setRowCount(self.current_summary_df.shape[0])
         self.summary_table_view.setColumnCount(self.current_summary_df.shape[1])
@@ -1300,13 +1627,25 @@ class BioStatExplorer(QMainWindow):
                 self.summary_table_view.setItem(r, c, QTableWidgetItem(str(self.current_summary_df.iat[r, c])))
         self.summary_table_view.resizeColumnsToContents()
 
-    def run_bg_sub(self):
-        if self.filtered_df is None: return
-        metrics = self.get_selected_metrics()
-        if not metrics: return
-        self.filtered_df = NormalizationEngine.background_subtraction(self.filtered_df, metrics[0], self.bg_spin.value())
+    def _add_column_to_data(self, make):
+        """Apply *make(df) -> df* (which adds a column) to the full dataset,
+        so the new column survives changing filters, then re-filter."""
+        self.master_df = make(self.master_df.copy())
+        self.filtered_df = FilterEngine.apply_multi_filter(
+            self.master_df, self.dock_filter_selections)
+        self.metric_cols = [c for c in self.master_df.columns
+                            if pd.api.types.is_numeric_dtype(self.master_df[c])]
         self.display_data(self.filtered_df)
         self.update_selectors()
+
+    def run_bg_sub(self):
+        if self.master_df is None: return
+        metrics = self.get_selected_metrics()
+        if not metrics: return
+        bg = self.bg_spin.value()
+        self._add_column_to_data(
+            lambda df: NormalizationEngine.background_subtraction(df, metrics[0], bg))
+        self.status_bar.showMessage(f"Added '{metrics[0]} (Bg Sub)' (minus {bg:g}).", 6000)
 
     def run_wt_fold(self):
         if self.filtered_df is None: return
@@ -1315,58 +1654,130 @@ class BioStatExplorer(QMainWindow):
         if not metrics or not reference:
             self.status_bar.showMessage("Select a Metric and a reference group ('Compare To') first.", 5000)
             return
-        self.filtered_df = NormalizationEngine.wild_type_fold_change(
-            self.filtered_df, metrics[0], self.x_selector.currentText(), wt_label=reference)
-        self.display_data(self.filtered_df)
-        self.update_selectors()
+        x = self.x_selector.currentText()
+        self._add_column_to_data(
+            lambda df: NormalizationEngine.wild_type_fold_change(df, metrics[0], x, wt_label=reference))
+        self.status_bar.showMessage(f"Added '{metrics[0]} (Fold Change)' relative to '{reference}'.", 6000)
+
+    def _run_stats_from_toolbar(self):
+        self.tabs.setCurrentWidget(self.analysis_tab)
+        self.run_statistical_pipeline()
 
     def run_statistical_pipeline(self):
         df = self.get_active_plot_df()
         x_var = self.x_selector.currentText()
         metrics = self.get_selected_metrics()
-        y_var = metrics[0] if metrics else None
-        if not x_var or not y_var or df is None: return
+        if not x_var or not metrics or df is None:
+            self.stats_output.setPlainText("Open data and choose an X axis and a "
+                                           "Metric on the Plotting Dashboard first.")
+            return
         self.update_summary_table_view()
 
-        test_override = self.stat_mode_selector.currentText()
-        if test_override == StatisticsEngine.NONE:
-            test_override = StatisticsEngine.AUTO
+        test = self.stat_mode_selector.currentText()
+        if test == StatisticsEngine.NONE:
+            test = StatisticsEngine.AUTO
+        hue = self.get_hue()
+        order = self._current_group_order()
+        texts, rows = [], []
+        for y_var in metrics:
+            if hue:
+                results = StatisticsEngine.compare_within(
+                    df, x_var, hue, y_var, test, self.get_reference(),
+                    self.get_pairing_col())
+                for g, r in results.items():
+                    texts.append(StatisticsEngine.format_report(r, hue, y_var, within=f"{x_var} = {g}"))
+                    rows += self._comparison_rows(r, y_var, f"{x_var} = {g}")
+                if len(results) > 1:
+                    texts.append("Note: p-values are also Holm-corrected across the "
+                                 f"{len(results)} '{x_var}' groups.")
+            else:
+                r = StatisticsEngine.compare(df, x_var, y_var, test, self.get_reference(),
+                                             self.get_pairing_col(), group_order=order)
+                texts.append(StatisticsEngine.format_report(r, x_var, y_var))
+                rows += self._comparison_rows(r, y_var)
+        self.current_comparisons = pd.DataFrame(rows)
+        self.stats_output.setPlainText(("\n\n" + "-" * 60 + "\n\n").join(texts))
 
-        report = StatisticsEngine.analyze_groups(
-            df, x_var, y_var,
-            test_override=test_override,
-            reference=self.get_reference(),
-            pairing_col=self.get_pairing_col()
-        )
-        self.stats_output.setText(report)
+    @staticmethod
+    def _comparison_rows(r, y_var, within=None):
+        out = []
+        for c in r.comparisons:
+            out.append({
+                "Metric": y_var, "Within": within or "", "Group A": c.a,
+                "Group B": c.b, "n A": c.n_a, "n B": c.n_b,
+                "Difference (A-B)": c.diff,
+                "95% CI low": c.ci[0] if c.ci else None,
+                "95% CI high": c.ci[1] if c.ci else None,
+                "p (adjusted)": c.p, "Significance": stars(c.p),
+                "p (unadjusted)": c.p_raw, "Effect size": c.effect,
+                "Test": r.test, "Post-hoc / correction": r.posthoc,
+                "Omnibus": r.omnibus})
+        return out
+
+    def _save_path(self, title, default_name, ext, filt):
+        start = os.path.join(self._last_dir(), default_name)
+        path, _ = QFileDialog.getSaveFileName(self, title, start, filt)
+        if not path:
+            return None
+        if not path.lower().endswith("." + ext):
+            path += "." + ext
+        self._remember_dir(path)
+        return path
 
     def export_current_plot(self, format_type):
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save Figure", f"publication_figure.{format_type}", f"Images (*.{format_type})")
-        if file_path:
-            directory = os.path.dirname(file_path)
-            filename = os.path.basename(file_path).split('.')[0]
-            saved = ExportEngine.save_figure(self.plot_figure, directory, filename, format_type)
-            self.status_bar.showMessage(f"Figure saved successfully to: {saved}", 5000)
+        labels = {"png": "PNG image", "svg": "SVG (editable text)", "pdf": "PDF",
+                  "tiff": "TIFF image"}
+        path = self._save_path("Export Figure", f"figure.{format_type}", format_type,
+                               f"{labels[format_type]} (*.{format_type})")
+        if path:
+            ExportEngine.save_figure_to(self.plot_figure, path, format_type)
+            self.status_bar.showMessage(f"Figure saved: {path}", 6000)
+
+    def _ensure_stats(self):
+        if not self.stats_output.toPlainText().strip() or getattr(
+                self, "current_comparisons", None) is None:
+            self.run_statistical_pipeline()
+        return self.current_summary_df is not None and not self.current_summary_df.empty
 
     def export_stats_data(self):
-        if self.current_summary_df is None or self.current_summary_df.empty: return
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save Analysis Data", "statistical_report.xlsx", "Excel Sheets (*.xlsx)")
-        if file_path:
-            directory = os.path.dirname(file_path)
-            filename = os.path.basename(file_path).split('.')[0]
-            saved = ExportEngine.save_excel_summary(self.current_summary_df, self.stats_output.toPlainText(), directory, filename)
-            self.status_bar.showMessage(f"Excel report saved to: {saved}", 5000)
+        if not self._ensure_stats():
+            QMessageBox.information(self, "Export Statistics", "Nothing to export yet — "
+                                    "open data and choose an X axis and a Metric.")
+            return
+        path = self._save_path("Export Statistics", "statistics.xlsx", "xlsx", "Excel (*.xlsx)")
+        if path:
+            ExportEngine.save_excel_summary_to(
+                path, self.current_summary_df, self.stats_output.toPlainText(),
+                getattr(self, "current_comparisons", None))
+            self.status_bar.showMessage(f"Statistics saved: {path}", 6000)
 
     def export_pdf_report(self):
-        if self.current_summary_df is None or self.current_summary_df.empty: return
-        file_path, _ = QFileDialog.getSaveFileName(self, "Compile Lab Dossier", "analytical_dossier.pdf", "Documents (*.pdf)")
-        if file_path:
-            self.status_bar.showMessage("Generating PDF layout elements...")
-            temp_img = os.path.join(os.path.dirname(file_path), "_temp_report_plot.png")
-            ExportEngine.save_figure(self.plot_figure, os.path.dirname(file_path), "_temp_report_plot", "png", dpi=300)
-            PDFReportGenerator.generate_pdf(file_path, self.current_summary_df, self.stats_output.toPlainText(), temp_img)
-            if os.path.exists(temp_img): os.remove(temp_img)
-            self.status_bar.showMessage(f"Dossier compiled successfully: {file_path}", 6000)
+        if not self._ensure_stats():
+            QMessageBox.information(self, "PDF Report", "Nothing to report yet — "
+                                    "open data and choose an X axis and a Metric.")
+            return
+        path = self._save_path("PDF Report", "report.pdf", "pdf", "PDF (*.pdf)")
+        if not path:
+            return
+        import tempfile
+        tmp = os.path.join(tempfile.mkdtemp(), "plot.png")
+        try:
+            ExportEngine.save_figure_to(self.plot_figure, tmp, "png", dpi=300)
+            PDFReportGenerator.generate_pdf(path, self.current_summary_df,
+                                            self.stats_output.toPlainText(), tmp)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        self.status_bar.showMessage(f"Report saved: {path}", 6000)
+
+    def export_data_csv(self):
+        df = self.get_active_plot_df()
+        if df is None or df.empty:
+            return
+        path = self._save_path("Export Data", "data.csv", "csv", "CSV (*.csv)")
+        if path:
+            df.to_csv(path, index=False)
+            self.status_bar.showMessage(f"{len(df)} rows saved: {path}", 6000)
 
 
 if __name__ == "__main__":

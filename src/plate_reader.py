@@ -79,7 +79,8 @@ def grid_to_long(grid_values, value_name="Value", n_rows=None, n_cols=None):
             records.append({
                 "Well": well_id(r, c),
                 "Row": string.ascii_uppercase[r] if r < 26 else well_id(r, 0)[:-len(str(c + 1))],
-                "Column": c + 1,
+                # zero-padded text: a category that sorts 01..12
+                "Column": f"{c + 1:02d}",
                 value_name: val,
             })
     df = pd.DataFrame(records)
@@ -143,3 +144,128 @@ def merge_well_layers(value_df, map_layer_dfs):
             continue
         result = result.merge(layer_df, on="Well", how="left")
     return result
+
+
+# ---------------------------------------------------------------------------
+# All plate blocks in an instrument export (e.g. BMG CLARIOstar: GFP and
+# mKate grids, raw and OD-normalised, in one sheet)
+# ---------------------------------------------------------------------------
+
+def _int_like(v):
+    try:
+        f = float(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+    return int(f) if f.is_integer() else None
+
+
+def _text(v):
+    return isinstance(v, str) and v.strip() != ""
+
+
+def find_plate_blocks(raw_df):
+    """
+    Every plate-shaped block in a sheet read with header=None: a row of
+    column numbers 1, 2, 3... with row letters A, B, C... down its left.
+    Returns a list of dicts: title, n_rows, n_cols, values (2-D list of
+    floats/None), cells (2-D list of the cell text), is_map (mostly text:
+    a plate map of strains/conditions, not readings), overflow (count of non-numeric cells such as 'OVRFLW'),
+    saturated (wells sharing the block's maximum value, a sign of a
+    saturated detector). Titles come from the text just above each block
+    ('1. Raw Data (485-15/528-20 1)'), prefixed with the section it sits
+    in when that differs ('Normalized data with OD').
+    """
+    from src.excel_loader import OVERFLOW
+    vals = raw_df.values
+    n_r, n_c = vals.shape
+    blocks, section = [], ""
+    used_rows = set()
+    for r in range(n_r - 1):
+        for c in range(n_c - 2):
+            if (r, c) in used_rows:
+                continue
+            # column numbers 1..k starting at (r, c+1); letters at (r+1.., c)
+            k = 0
+            while c + 1 + k < n_c and _int_like(vals[r, c + 1 + k]) == k + 1:
+                k += 1
+            if k < 3:
+                continue
+            rows = 0
+            while (r + 1 + rows < n_r and _text(vals[r + 1 + rows, c]) and
+                   vals[r + 1 + rows, c].strip().upper() ==
+                   string.ascii_uppercase[rows % 26]):
+                rows += 1
+            if rows < 2:
+                continue
+            # title: nearest text above the header row, within 3 rows
+            title = ""
+            for rr in range(r - 1, max(-1, r - 4), -1):
+                texts = [str(vals[rr, cc]).strip() for cc in range(c, min(n_c, c + k + 1))
+                         if _text(vals[rr, cc])]
+                if texts:
+                    title = texts[0]
+                    break
+            # a section heading between the previous block and this one
+            prev_end = blocks[-1]["_end"] if blocks else -1
+            for rr in range(prev_end + 1, max(prev_end + 1, r - 1)):
+                for cc in range(n_c):
+                    t = vals[rr, cc]
+                    if _text(t) and t.strip() != title and \
+                            re.search(r"normali|blank|corrected|ratio|mean", t, re.I):
+                        section = t.strip()
+            block = vals[r + 1:r + 1 + rows, c + 1:c + 1 + k]
+            cells = [["" if v is None or (isinstance(v, float) and pd.isna(v))
+                      else (f"{v:g}" if isinstance(v, float) else str(v).strip())
+                      for v in row] for row in block]
+            out, overflow = [], 0
+            for row in block:
+                line = []
+                for v in row:
+                    if isinstance(v, (int, float)) and not pd.isna(v):
+                        line.append(float(v))
+                    elif _text(v) and OVERFLOW.match(v):
+                        overflow += 1
+                        line.append(None)
+                    else:
+                        try:
+                            line.append(float(str(v).replace(",", ".")))
+                        except (TypeError, ValueError):
+                            line.append(None)
+                out.append(line)
+            flat = [v for line in out for v in line if v is not None]
+            saturated = 0
+            if len(flat) >= 4:
+                top = max(flat)
+                saturated = sum(1 for v in flat if v == top)
+                saturated = saturated if saturated >= 2 else 0
+            name = re.sub(r"^\s*\d+\.\s*", "", title) or f"Plate {len(blocks) + 1}"
+            if section and not name.lower().startswith(section.lower()):
+                short = re.sub(r"^\s*\d+\.\s*", "", section)
+                name = f"{name} — {short}"
+            n_text = sum(1 for row in block for v in row
+                         if _text(v) and not OVERFLOW.match(v)
+                         and _int_like(v) is None)
+            blocks.append({"title": name, "n_rows": rows, "n_cols": k,
+                           "values": out, "cells": cells,
+                           "is_map": n_text > 0 and n_text >= len(flat),
+                           "overflow": overflow,
+                           "saturated": saturated, "_end": r + rows})
+            for rr in range(r, r + 1 + rows):
+                used_rows.add((rr, c))
+    # unique titles
+    seen = {}
+    for b in blocks:
+        t = b["title"]
+        seen[t] = seen.get(t, 0) + 1
+        if seen[t] > 1:
+            b["title"] = f"{t} ({seen[t]})"
+        b.pop("_end", None)
+    return blocks
+
+
+def shape_name(n_rows, n_cols):
+    """The PLATE_SHAPES key that fits a block (smallest plate it fits)."""
+    for name, (r, c) in sorted(PLATE_SHAPES.items(), key=lambda kv: kv[1][0] * kv[1][1]):
+        if n_rows <= r and n_cols <= c:
+            return name
+    return "384-well (16x24)"

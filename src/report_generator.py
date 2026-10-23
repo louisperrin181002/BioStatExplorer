@@ -1,7 +1,8 @@
 # src/report_generator.py
 
 import os
-from reportlab.lib.pagesizes import letter
+from reportlab.lib.pagesizes import A4
+from xml.sax.saxutils import escape
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
@@ -14,7 +15,7 @@ class PDFReportGenerator:
         the generated graph, summary statistics, and hypothesis outcomes.
         """
         # Page Setup
-        doc = SimpleDocTemplate(output_path, pagesize=letter,
+        doc = SimpleDocTemplate(output_path, pagesize=A4,
                                 rightMargin=40, leftMargin=40, topMargin=40, bottomMargin=40)
         story = []
         styles = getSampleStyleSheet()
@@ -41,7 +42,10 @@ class PDFReportGenerator:
         story.append(Paragraph("1. Generated Data Visualization", section_style))
         if os.path.exists(temp_plot_path):
             # Read plot file and scale nicely for a letter page width
-            img = Image(temp_plot_path, width=360, height=270)
+            from reportlab.lib.utils import ImageReader
+            iw, ih = ImageReader(temp_plot_path).getSize()
+            w = min(doc.width, 460)             # keep the plot's proportions
+            img = Image(temp_plot_path, width=w, height=w * ih / iw)
             story.append(img)
         else:
             story.append(Paragraph("[Visual Graph Not Detected]", body_style))
@@ -78,8 +82,13 @@ class PDFReportGenerator:
 
         # 3. Structural Hypothesis Verification Data
         story.append(Paragraph("3. Hypothesis Testing Matrix & Insights", section_style))
-        formatted_text = stat_text.replace('\n', '<br/>')
-        story.append(Paragraph(formatted_text, body_style))
+        # escape <, > and & ("p < 0.0001" would otherwise break the PDF)
+        mono = ParagraphStyle('Mono', parent=body_style, fontName='Courier',
+                              fontSize=8, leading=10)
+        for block in stat_text.split('\n\n'):
+            formatted = escape(block).replace('\n', '<br/>')
+            story.append(Paragraph(formatted, mono))
+            story.append(Spacer(1, 6))
 
         # Build Document
         doc.build(story)

@@ -5,7 +5,7 @@ import scipy.stats as stats
 
 class SummaryStatistics:
     @staticmethod
-    def generate_table(df, x_col, y_col):
+    def generate_table(df, x_col, y_col, order=None):
         """Computes summary statistics, SEM, and 95% CI for each group."""
         if df is None or df.empty or not x_col or not y_col:
             return pd.DataFrame()
@@ -15,7 +15,13 @@ class SummaryStatistics:
         df_clean = df_clean.dropna()
         
         summary_data = []
-        for name, group in df_clean.groupby(x_col):
+        groups = dict(list(df_clean.groupby(x_col, sort=False)))
+        names = list(groups)
+        if order:   # same order as the plot and the report
+            want = [n for o in order for n in names if str(n) == str(o)]
+            names = want + [n for n in names if n not in want]
+        for name in names:
+            group = groups[name]
             values = group[y_col].values
             n = len(values)
             if n == 0: continue
