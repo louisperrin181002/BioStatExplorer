@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 import scipy.stats as stats
 
-from src.statistics_engine import StatisticsEngine
+from src.statistics_engine import StatisticsEngine, stars, format_p
 
 
 class PlottingEngine:
@@ -16,7 +16,7 @@ class PlottingEngine:
                        reference=None, pairing_col=None, show_pvalue=False,
                        y_min=None, y_max=None, group_colors=None, bw_mode=False,
                        hist_bins=20, custom_title=None, custom_xlabel=None,
-                       custom_ylabel=None, group_order=None):
+                       custom_ylabel=None, group_order=None, show_ns=False):
         """Generates plots while respecting active application theme states and overlays stars."""
         ax.clear()
 
@@ -143,14 +143,37 @@ class PlottingEngine:
 
         if log_scale:
             ax.set_yscale("log")
+            lo_hi = pd.to_numeric(df[y_col], errors="coerce")
+            lo_hi = lo_hi[lo_hi > 0]
+            if len(lo_hi) and lo_hi.max() / lo_hi.min() < 100:
+                # under two decades the default log ticks have no labels
+                from matplotlib.ticker import FuncFormatter, LogLocator
+                fmt = FuncFormatter(lambda v, _: f"{v:g}")
+                ax.yaxis.set_major_locator(LogLocator(subs=(1, 2, 5)))
+                ax.yaxis.set_major_formatter(fmt)
+                ax.yaxis.set_minor_formatter(FuncFormatter(lambda v, _: ""))
 
         # --- STATISTICAL OVERLAY CORE (categorical charts only — a continuous
         # line plot compares curves, not discrete groups, so it's skipped) ---
         if (not is_line and len(unique_groups) >= 2 and plot_type in
                 ["Boxplot", "Violin", "Beeswarm", "Box + Swarm", "Bar"] and stat_mode != "None"):
-            PlottingEngine.annotate_significance(df, x_col, y_col, unique_groups, ax, stat_mode,
-                                                  line_color, reference=reference, pairing_col=pairing_col,
-                                                  log_scale=log_scale, show_pvalue=show_pvalue)
+            bar_tops = None
+            if plot_type == "Bar":
+                # brackets must clear the error bars, not just the points
+                keys = [x_col] + ([hue_col] if hue_col else [])
+                yv = pd.to_numeric(df[y_col], errors="coerce")
+                g = yv.groupby([df[k] for k in keys])
+                tops = (g.mean() + g.sem().fillna(0)).dropna()
+                if hue_col:
+                    tops = tops.groupby(level=0).max()
+                bar_tops = {str(k): float(v) for k, v in tops.items()}
+            PlottingEngine.annotate_significance(
+                df, x_col, y_col, unique_groups, ax, stat_mode, line_color,
+                reference=reference, pairing_col=pairing_col,
+                log_scale=log_scale, show_pvalue=show_pvalue,
+                hue_col=hue_col, hue_order=[str(h) for h in hue_order],
+                dodge_width=PlottingEngine.DODGE_WIDTH.get(plot_type, 0.8),
+                show_ns=show_ns, bar_tops=bar_tops)
 
         if not is_line:
             # Rotate labels 45 degrees, shrink font to size 10, and right-align them
@@ -706,122 +729,174 @@ class PlottingEngine:
             for text in legend.get_texts():
                 text.set_color(text_color)
 
+    # Dodge width used by each chart type when a Color-By column is set
+    # (where each colour's bar/box sits inside its x group)
+    DODGE_WIDTH = {"Bar": 0.8, "Boxplot": 0.5, "Violin": 0.8,
+                   "Beeswarm": 0.8, "Box + Swarm": 0.8}
+    MAX_BRACKETS = 15
+
+    @staticmethod
+    def _artist_tops(ax, n_groups) -> dict:
+        """{x position: highest y drawn there} over everything on the axes
+        (violins reach past the data points; bars carry error bars)."""
+        from matplotlib.collections import PathCollection
+        xs, ys = [], []
+        for coll in ax.collections:
+            if coll.get_transform() != ax.transData and \
+                    not isinstance(coll, PathCollection):
+                continue
+            if isinstance(coll, PathCollection):
+                off = np.asarray(coll.get_offsets())
+                if off.size:
+                    xs.append(off[:, 0]); ys.append(off[:, 1])
+            else:
+                for path in coll.get_paths():
+                    v = path.vertices
+                    if len(v):
+                        i = np.argmax(v[:, 1])
+                        xs.append([v[:, 0].mean()]); ys.append([v[i, 1]])
+        for line in ax.lines:
+            xy = np.asarray(line.get_xydata(), float)
+            if xy.size:
+                xs.append(xy[:, 0]); ys.append(xy[:, 1])
+        for patch in ax.patches:
+            try:
+                bb = patch.get_bbox()
+                xs.append([(bb.x0 + bb.x1) / 2]); ys.append([bb.y1])
+            except Exception:
+                continue
+        if not xs:
+            return {}
+        x = np.concatenate([np.ravel(a) for a in xs]).astype(float)
+        y = np.concatenate([np.ravel(a) for a in ys]).astype(float)
+        ok = np.isfinite(x) & np.isfinite(y)
+        x, y = x[ok], y[ok]
+        out = {}
+        for i in range(n_groups):
+            m = np.abs(x - i) < 0.5
+            if m.any():
+                out[i] = float(y[m].max())
+        return out
+
     @staticmethod
     def annotate_significance(df, x_col, y_col, groups, ax, stat_mode, line_color,
-                               reference=None, pairing_col=None, log_scale=False, show_pvalue=False):
+                               reference=None, pairing_col=None, log_scale=False,
+                               show_pvalue=False, hue_col=None, hue_order=None,
+                               dodge_width=0.8, show_ns=False, bar_tops=None):
         """
-        Calculates pairwise stats based on chosen mode and plots matching asterisks.
-        If `reference` is given, only draws brackets between the reference group
-        and each other group (instead of every pairwise combination).
+        Draws significance brackets from StatisticsEngine.compare() — the
+        same results the Statistical Analysis tab reports. Without a
+        Color-By column the x groups are compared; with one, the colours are
+        compared inside each x group (Holm-corrected across groups).
+        Brackets are stacked from the shortest up, each just above the data
+        it spans. Returns the comparisons drawn.
         """
-        df_clean = df[[x_col, y_col]].dropna()
-        df_clean[y_col] = pd.to_numeric(df_clean[y_col], errors='coerce')
-        df_clean = df_clean.dropna()
+        SE = StatisticsEngine
+        d = df.copy()
+        d[y_col] = pd.to_numeric(d[y_col], errors="coerce")
+        d = d.dropna(subset=[x_col, y_col])
+        if d.empty:
+            return []
+        d["_x"] = d[x_col].astype(str)
+        groups = [str(g) for g in groups]
+        xpos = {g: i for i, g in enumerate(groups)}
 
-        max_y = df_clean[y_col].max()
-        min_y = df_clean[y_col].min()
-        y_range = max_y - min_y if (max_y - min_y) > 0 else 1.0
+        if hue_col:
+            d["_h"] = d[hue_col].astype(str)
+            levels = [str(h) for h in (hue_order or d["_h"].unique())]
+            n = max(len(levels), 1)
+            step = dodge_width / n
 
-        bar_step = y_range * (0.19 if show_pvalue else 0.15)
-        current_bar_y = max_y + (y_range * 0.05)
-        group_positions = {group: i for i, group in enumerate(groups)}
-
-        # Build the list of pairs to test: all combinations, or reference-vs-others only
-        if reference is not None and reference in groups:
-            pairs = [(reference, g) for g in groups if g != reference]
+            def pos(c):
+                base = xpos[c.within]
+                return (base + (levels.index(c.a) - (n - 1) / 2) * step,
+                        base + (levels.index(c.b) - (n - 1) / 2) * step)
+            results = SE.compare_within(d, "_x", "_h", y_col, stat_mode,
+                                        reference, pairing_col, levels)
+            comps = [c for r in results.values() for c in r.comparisons
+                     if c.within in xpos]
         else:
-            pairs = [(groups[i], groups[j]) for i in range(len(groups)) for j in range(i + 1, len(groups))]
+            r = SE.compare(d, "_x", y_col, stat_mode, reference, pairing_col,
+                           group_order=groups)
+            comps = [c for c in r.comparisons if c.a in xpos and c.b in xpos]
 
-        # Pre-compute posthoc results once for tests that need an omnibus step
-        dunn_lookup = {}
-        if stat_mode == StatisticsEngine.KRUSKAL_DUNN:
-            group_arrays = [df_clean[df_clean[x_col] == g][y_col].values for g in groups]
-            if all(len(g) > 0 for g in group_arrays):
-                for r in StatisticsEngine.dunns_test(group_arrays, groups):
-                    dunn_lookup[frozenset([r["group_a"], r["group_b"]])] = r["p_value"]
+            def pos(c):
+                return xpos[c.a], xpos[c.b]
 
-        tukey_lookup = {}
-        if stat_mode == StatisticsEngine.ANOVA_TUKEY:
-            group_arrays = [df_clean[df_clean[x_col] == g][y_col].values for g in groups]
-            if all(len(g) > 1 for g in group_arrays):
-                tukey_res = stats.tukey_hsd(*group_arrays)
-                for i in range(len(groups)):
-                    for j in range(i + 1, len(groups)):
-                        tukey_lookup[frozenset([groups[i], groups[j]])] = tukey_res.pvalue[i, j]
+        shown = [c for c in comps if show_ns or c.significant]
+        if not shown:
+            return []
 
-        annotated_pairs = 0
-        for g1, g2 in pairs:
-            if annotated_pairs >= 6:
-                break
+        # work in display units (log10 on a log axis)
+        to_u = (lambda v: np.log10(v)) if log_scale else (lambda v: v)
+        from_u = (lambda u: 10 ** u) if log_scale else (lambda u: u)
+        vals = d[y_col].to_numpy(float)
+        if log_scale:
+            vals = vals[vals > 0]
+            if vals.size == 0:
+                return []
+        lo, hi = to_u(vals.min()), to_u(vals.max())
+        if bar_tops:
+            hi = max(hi, max(to_u(v) for v in bar_tops.values() if v > 0)
+                     if any(v > 0 for v in bar_tops.values()) else hi)
+        span = (hi - lo) or 1.0
+        step_u = span * (0.13 if show_pvalue else 0.10)
+        tick = step_u * 0.18
 
-            key = frozenset([g1, g2])
-            p_val = None
+        drawn_tops = PlottingEngine._artist_tops(ax, len(groups))
+        if drawn_tops:
+            hi = max([hi] + [to_u(v) for v in drawn_tops.values() if v > 0])
+            span = (hi - lo) or 1.0
+            step_u = span * (0.13 if show_pvalue else 0.10)
+            tick = step_u * 0.18
 
-            if stat_mode == StatisticsEngine.KRUSKAL_DUNN:
-                p_val = dunn_lookup.get(key)
-            elif stat_mode == StatisticsEngine.ANOVA_TUKEY:
-                p_val = tukey_lookup.get(key)
-            elif stat_mode in (StatisticsEngine.PAIRED_T, StatisticsEngine.WILCOXON):
-                v1, v2, err = StatisticsEngine.pair_values(df_clean, x_col, y_col, g1, g2, pairing_col)
-                if err or v1 is None:
-                    continue
-                if stat_mode == StatisticsEngine.PAIRED_T:
-                    _, p_val = stats.ttest_rel(v1, v2)
-                else:
-                    try:
-                        _, p_val = stats.wilcoxon(v1, v2)
-                    except ValueError:
-                        continue
-            else:
-                vals1 = df_clean[df_clean[x_col] == g1][y_col].values
-                vals2 = df_clean[df_clean[x_col] == g2][y_col].values
-                if len(vals1) < 2 or len(vals2) < 2:
-                    continue
+        def top_of(x1, x2):
+            """Highest thing drawn (points, bar + error, box, violin)
+            between two x positions."""
+            a, b = sorted((x1, x2))
+            gs = [g for g, i in xpos.items() if a - 0.5 < i < b + 0.5]
+            sub = d[d["_x"].isin(gs)][y_col].to_numpy(float)
+            if log_scale:
+                sub = sub[sub > 0]
+            t = to_u(sub.max()) if sub.size else hi
+            for g in gs:
+                v = drawn_tops.get(xpos[g])
+                if v is not None and (v > 0 or not log_scale):
+                    t = max(t, to_u(v))
+            if bar_tops:
+                t = max([t] + [to_u(bar_tops[g]) for g in gs
+                               if bar_tops.get(g, 0) > 0])
+            return t
 
-                if stat_mode == StatisticsEngine.AUTO:
-                    _, p_norm1 = stats.shapiro(vals1) if len(vals1) >= 3 else (0, 1.0)
-                    _, p_norm2 = stats.shapiro(vals2) if len(vals2) >= 3 else (0, 1.0)
-                    _, p_levene = stats.levene(vals1, vals2)
-                    if p_norm1 > 0.05 and p_norm2 > 0.05 and p_levene > 0.05:
-                        _, p_val = stats.ttest_ind(vals1, vals2, equal_var=True)
-                    elif p_norm1 > 0.05 and p_norm2 > 0.05:
-                        _, p_val = stats.ttest_ind(vals1, vals2, equal_var=False)
-                    else:
-                        _, p_val = stats.mannwhitneyu(vals1, vals2)
-                elif stat_mode == StatisticsEngine.STUDENTS_T:
-                    _, p_val = stats.ttest_ind(vals1, vals2, equal_var=True)
-                elif stat_mode == StatisticsEngine.WELCH_T:
-                    _, p_val = stats.ttest_ind(vals1, vals2, equal_var=False)
-                elif stat_mode == StatisticsEngine.MANN_WHITNEY:
-                    _, p_val = stats.mannwhitneyu(vals1, vals2)
-                else:
-                    continue
-
-            if p_val is None:
-                continue
-            if p_val < 0.001: star_str = "***"
-            elif p_val < 0.01: star_str = "**"
-            elif p_val < 0.05: star_str = "*"
-            else: continue  # Don't render non-significant elements
-
+        placed = []                         # (x1, x2, level)
+        shown.sort(key=lambda c: abs(pos(c)[1] - pos(c)[0]))
+        drawn = []
+        for c in shown[:PlottingEngine.MAX_BRACKETS]:
+            x1, x2 = sorted(pos(c))
+            level = top_of(x1, x2) + step_u * 0.6
+            for (a, b, lev) in placed:      # stack above overlapping ones
+                if a - 0.05 <= x2 and x1 <= b + 0.05:
+                    level = max(level, lev + step_u)
+            placed.append((x1, x2, level))
+            label = stars(c.p)
             if show_pvalue:
-                # e.g. "*** (p=0.0004)" — scientific notation once it's too
-                # small to read comfortably as a decimal.
-                p_text = f"{p_val:.4f}" if p_val >= 0.0001 else f"{p_val:.2e}"
-                label_str = f"{star_str} (p={p_text})"
-                label_fontsize = 9
-            else:
-                label_str = star_str
-                label_fontsize = 11
-
-            x1, x2 = group_positions[g1], group_positions[g2]
-            h = bar_step * 0.15
-
-            ax.plot([x1, x1, x2, x2], [current_bar_y, current_bar_y + h, current_bar_y + h, current_bar_y], lw=1.2, color=line_color)
-            ax.text((x1 + x2) * 0.5, current_bar_y + h, label_str, ha='center', va='bottom', color=line_color, fontsize=label_fontsize, fontweight='bold')
-
-            current_bar_y += bar_step
-            annotated_pairs += 1
-
-        if not log_scale:
-            ax.set_ylim(bottom=None, top=current_bar_y + (bar_step * 0.5))
+                label = f"{label} ({format_p(c.p)})" if label != "ns" \
+                    else format_p(c.p)
+            ys = [from_u(level), from_u(level + tick)]
+            ax.plot([x1, x1, x2, x2], [ys[0], ys[1], ys[1], ys[0]], lw=1.1,
+                    color=line_color, solid_capstyle="butt")
+            ax.text((x1 + x2) / 2, from_u(level + tick), label, ha="center",
+                    va="bottom", color=line_color,
+                    fontsize=8.5 if show_pvalue else 10.5,
+                    fontweight="bold" if label != "ns" else "normal")
+            drawn.append(c)
+        top = max(lev for _, _, lev in placed) + step_u
+        extra = len(shown) - len(drawn)
+        if extra > 0:
+            ax.text(0.99, 0.99, f"+{extra} more significant comparison"
+                    f"{'s' if extra != 1 else ''} — see Statistical Analysis",
+                    transform=ax.transAxes, ha="right", va="top",
+                    fontsize=7.5, color=line_color)
+        bottom = ax.get_ylim()[0]
+        ax.set_ylim(bottom=bottom, top=from_u(top))
+        return drawn
