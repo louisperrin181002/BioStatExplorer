@@ -22,6 +22,7 @@ from src.excel_loader import DataLoader, sheet_names, read_grid
 from src.plotting import PlottingEngine, PALETTE_NAMES, palette_colors
 from src.groups_panel import GroupsPanel
 from src.curves_tab import CurvesTab
+from src.layout_tab import LayoutTab
 from src.filters import FilterEngine
 from src.normalization import NormalizationEngine, plate_normalise
 from src.statistics_engine import StatisticsEngine, format_p, stars
@@ -673,6 +674,13 @@ class BioStatExplorer(QMainWindow):
         canvas_card.setObjectName("Card")
         cl = QVBoxLayout(canvas_card)
         cl.setContentsMargins(8, 8, 8, 8)
+        head = QHBoxLayout()
+        head.addStretch()
+        add_layout_btn = QPushButton("＋ Add to Layout")
+        add_layout_btn.setToolTip("Put this graph on the figure page (Layout tab)")
+        add_layout_btn.clicked.connect(self._add_to_layout)
+        head.addWidget(add_layout_btn)
+        cl.addLayout(head)
         cl.addWidget(self.plot_canvas)
 
         self.groups_panel = GroupsPanel()
@@ -753,6 +761,11 @@ class BioStatExplorer(QMainWindow):
         self.curves_tab.send_parameters.connect(self._use_curve_parameters)
         self.curves_tab.export_requested.connect(self._export_curve_parameters)
         self.tabs.addTab(self.curves_tab, "Curves")
+        self.layout_tab = LayoutTab(lambda ax, df, spec: BioStatExplorer.draw_metric(
+            ax, df, spec, spec["metrics"][0]))
+        self.layout_tab.export_requested.connect(self._export_layout)
+        self.layout_tab.changed.connect(self._mark_dirty)
+        self.tabs.addTab(self.layout_tab, "Layout")
         self.setCentralWidget(self.tabs)
 
     def init_plate_reader_tab(self):
@@ -2179,7 +2192,7 @@ class BioStatExplorer(QMainWindow):
             "spec": self.plot_spec(),
             "dock_filters": {k: list(v) for k, v in self.dock_filter_selections.items()},
             "plate": self._plate_state(),
-            "layout": self.layout_tab.to_list() if hasattr(self, "layout_tab") else [],
+            "layout": self.layout_tab.to_list(for_file) if hasattr(self, "layout_tab") else [],
             "curves": self.curves_tab.to_dict() if hasattr(self, "curves_tab") else {},
         }
 
@@ -2394,6 +2407,33 @@ class BioStatExplorer(QMainWindow):
             event.ignore()
             return
         super().closeEvent(event)
+
+    # --- figure layout ---
+    def _add_to_layout(self):
+        df = self.get_active_plot_df()
+        spec = self.plot_spec()
+        if df is None or df.empty or not spec["metrics"]:
+            QMessageBox.information(self, "Layout", "Set up a graph first.")
+            return
+        self._push_undo()
+        for metric in spec["metrics"]:
+            self.layout_tab.add_panel(dict(spec, metrics=[metric]), df)
+        n = len(self.layout_tab.panels)
+        self.status_bar.showMessage(f"Added to the Layout tab ({n} panel"
+                                    f"{'s' if n != 1 else ''})", 5000)
+
+    def _export_layout(self, fmt):
+        if not self.layout_tab.panels:
+            QMessageBox.information(self, "Layout", "Add some graphs to the layout first.")
+            return
+        names = {"pdf": "PDF", "svg": "SVG (editable text)", "png": "PNG image",
+                 "tiff": "TIFF image"}
+        path = self._save_path("Export Figure Page", f"figure.{fmt}", fmt,
+                               f"{names[fmt]} (*.{fmt})")
+        if path:
+            self.layout_tab.export_figure(path, fmt, self._export_dpi())
+            w, h, _, _ = self.layout_tab.page_size_mm()
+            self.status_bar.showMessage(f"Saved {path} ({w:.0f} × {h:.0f} mm)", 8000)
 
     # --- curves ---
     def _use_curve_parameters(self, params):
