@@ -430,14 +430,26 @@ class BioStatExplorer(QMainWindow):
                      self.import_plate_file, "Ctrl+Shift+I")
         file_menu.addSeparator()
         self.export_menu = file_menu.addMenu("Export")
-        self._action(self.export_menu, "Figure (PNG, 600 dpi)…",
+        self._action(self.export_menu, "Figure (PNG)…",
                      lambda: self.export_current_plot("png"), "Ctrl+Shift+E")
         self._action(self.export_menu, "Figure (SVG — editable in Inkscape)…",
                      lambda: self.export_current_plot("svg"))
         self._action(self.export_menu, "Figure (PDF)…",
                      lambda: self.export_current_plot("pdf"))
-        self._action(self.export_menu, "Figure (TIFF, 600 dpi)…",
+        self._action(self.export_menu, "Figure (TIFF)…",
                      lambda: self.export_current_plot("tiff"))
+        res = self.export_menu.addMenu("Figure Resolution (PNG / TIFF)")
+        from PySide6.QtGui import QActionGroup
+        grp = QActionGroup(res)
+        for d, note in ((300, ""), (600, "  (journals)"), (1200, "  (line art)")):
+            a = res.addAction(f"{d} dpi{note}")
+            a.setCheckable(True)
+            a.setChecked(d == self._export_dpi())
+            a.triggered.connect(lambda _c=False, d=d: QSettings(
+                "BioStatExplorer", "BioStatExplorer").setValue("export_dpi", d))
+            grp.addAction(a)
+        res.addSeparator()
+        res.addAction("SVG and PDF are vector: sharp at any size").setEnabled(False)
         self.export_menu.addSeparator()
         self._action(self.export_menu, "Statistics (Excel)…",
                      self.export_stats_data, "Ctrl+E")
@@ -1043,6 +1055,14 @@ class BioStatExplorer(QMainWindow):
         if files:
             self._remember_dir(files[0])
             self.process_files(files, append=bool(append))
+
+    @staticmethod
+    def _export_dpi():
+        try:
+            d = int(QSettings("BioStatExplorer", "BioStatExplorer").value("export_dpi", 600))
+        except (TypeError, ValueError):
+            d = 600
+        return d if d in (300, 600, 1200) else 600
 
     def _last_dir(self):
         return QSettings("BioStatExplorer", "BioStatExplorer").value("last_dir", "")
@@ -1769,12 +1789,13 @@ class BioStatExplorer(QMainWindow):
         return path
 
     def export_current_plot(self, format_type):
-        labels = {"png": "PNG image", "svg": "SVG (editable text)", "pdf": "PDF",
-                  "tiff": "TIFF image"}
+        dpi = self._export_dpi()
+        labels = {"png": f"PNG image, {dpi} dpi", "svg": "SVG (editable text)",
+                  "pdf": "PDF", "tiff": f"TIFF image, {dpi} dpi"}
         path = self._save_path("Export Figure", f"figure.{format_type}", format_type,
                                f"{labels[format_type]} (*.{format_type})")
         if path:
-            ExportEngine.save_figure_to(self.plot_figure, path, format_type)
+            ExportEngine.save_figure_to(self.plot_figure, path, format_type, dpi=dpi)
             self.status_bar.showMessage(f"Figure saved: {path}", 6000)
 
     def _ensure_stats(self):
@@ -1806,7 +1827,7 @@ class BioStatExplorer(QMainWindow):
         import tempfile
         tmp = os.path.join(tempfile.mkdtemp(), "plot.png")
         try:
-            ExportEngine.save_figure_to(self.plot_figure, tmp, "png", dpi=300)
+            ExportEngine.save_figure_to(self.plot_figure, tmp, "png", dpi=self._export_dpi())
             PDFReportGenerator.generate_pdf(path, self.current_summary_df,
                                             self.stats_output.toPlainText(), tmp)
         finally:
