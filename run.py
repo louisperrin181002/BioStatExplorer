@@ -21,6 +21,7 @@ from matplotlib.figure import Figure
 from src.excel_loader import DataLoader, sheet_names, read_grid
 from src.plotting import PlottingEngine, PALETTE_NAMES, palette_colors
 from src.groups_panel import GroupsPanel
+from src.curves_tab import CurvesTab
 from src.filters import FilterEngine
 from src.normalization import NormalizationEngine, plate_normalise
 from src.statistics_engine import StatisticsEngine, format_p, stars
@@ -29,53 +30,12 @@ from src.export_engine import ExportEngine
 from src.report_generator import PDFReportGenerator
 from src import plate_reader as pr
 from src import theme
+from src.table_model import PandasModel
 from src import project
 
 NO_SELECTION = "(none)"
 DATA_FILTER = "Data files (*.xlsx *.xlsm *.xls *.csv *.tsv *.txt)"
 DATA_EXT = (".xlsx", ".xlsm", ".xls", ".csv", ".tsv", ".txt")
-
-
-class PandasModel(QAbstractTableModel):
-    """Shows a DataFrame in a QTableView without copying it into one
-    widget per cell (fast for thousands of rows)."""
-
-    def __init__(self, df=None, parent=None):
-        super().__init__(parent)
-        self._df = df if df is not None else pd.DataFrame()
-
-    def set_frame(self, df):
-        self.beginResetModel()
-        self._df = df if df is not None else pd.DataFrame()
-        self.endResetModel()
-
-    def rowCount(self, parent=QModelIndex()):
-        return 0 if parent.isValid() else len(self._df)
-
-    def columnCount(self, parent=QModelIndex()):
-        return 0 if parent.isValid() else self._df.shape[1]
-
-    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
-        if not index.isValid():
-            return None
-        v = self._df.iat[index.row(), index.column()]
-        if role == Qt.ItemDataRole.DisplayRole:
-            if v is None or (isinstance(v, float) and np.isnan(v)):
-                return ""
-            if isinstance(v, (float, np.floating)):
-                return f"{v:.6g}"
-            return str(v)
-        if role == Qt.ItemDataRole.TextAlignmentRole and isinstance(
-                v, (int, float, np.number)):
-            return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        return None
-
-    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
-        if role != Qt.ItemDataRole.DisplayRole:
-            return None
-        if orientation == Qt.Orientation.Horizontal:
-            return str(self._df.columns[section])
-        return str(section + 1)
 
 
 class PasteableTableWidget(QTableWidget):
@@ -788,6 +748,11 @@ class BioStatExplorer(QMainWindow):
         self.tabs.addTab(self.plate_tab, "Plate")
         self.tabs.addTab(self.graph_tab, "Plotting Dashboard")
         self.tabs.addTab(self.analysis_tab, "Statistical Analysis")
+        self.curves_tab = CurvesTab(lambda: (self.get_active_plot_df(),
+                                             list(getattr(self, "metric_cols", []))))
+        self.curves_tab.send_parameters.connect(self._use_curve_parameters)
+        self.curves_tab.export_requested.connect(self._export_curve_parameters)
+        self.tabs.addTab(self.curves_tab, "Curves")
         self.setCentralWidget(self.tabs)
 
     def init_plate_reader_tab(self):
@@ -1454,6 +1419,8 @@ class BioStatExplorer(QMainWindow):
         self.metadata_col_list.addItems(self.metadata_cols)
         self.rebuild_data_selection_panel()      # before plotting with it
         self.update_selectors(choose_defaults=not append)
+        if hasattr(self, "curves_tab"):
+            self.curves_tab.refresh_columns()
         self.status_bar.showMessage(f"Loaded {combined.shape[0]} rows, {combined.shape[1]} columns.", 4000)
 
     # ---------------------------------------------------------------
@@ -2427,6 +2394,29 @@ class BioStatExplorer(QMainWindow):
             event.ignore()
             return
         super().closeEvent(event)
+
+    # --- curves ---
+    def _use_curve_parameters(self, params):
+        if params is None or params.empty:
+            QMessageBox.information(self, "Curves", "Fit some curves first.")
+            return
+        group = self.curves_tab.color.currentText()
+        self.ingest_dataframe(params.drop(columns=["Note"], errors="ignore"),
+                              append=False, source_label="Curve fits")
+        if group in self.metadata_cols:
+            self.x_selector.setCurrentText(group)
+        self.tabs.setCurrentWidget(self.graph_tab)
+        self.status_bar.showMessage("Now plotting the fitted parameters — Undo (⌘Z) "
+                                    "brings your data back", 10000)
+
+    def _export_curve_parameters(self, params):
+        if params is None or params.empty:
+            return
+        path = self._save_path("Export Parameters", "curve_parameters.xlsx", "xlsx",
+                               "Excel (*.xlsx)")
+        if path:
+            params.to_excel(path, index=False)
+            self.status_bar.showMessage(f"Saved {path}", 6000)
 
     def _save_path(self, title, default_name, ext, filt):
         start = os.path.join(self._last_dir(), default_name)
