@@ -29,6 +29,7 @@ from src.export_engine import ExportEngine
 from src.report_generator import PDFReportGenerator
 from src import plate_reader as pr
 from src import theme
+from src import project
 
 NO_SELECTION = "(none)"
 DATA_FILTER = "Data files (*.xlsx *.xlsm *.xls *.csv *.tsv *.txt)"
@@ -401,8 +402,12 @@ class BioStatExplorer(QMainWindow):
 
         self.init_central_widget()
         self.init_dock_panels()
+        self._undo_stack, self._redo_stack = [], []
+        self._project_path = None
+        self._dirty = False
         self.init_menu()
         self._building = False
+        self._update_title()
         self.apply_theme()
 
         self.status_bar = QStatusBar()
@@ -422,6 +427,11 @@ class BioStatExplorer(QMainWindow):
     def init_menu(self):
         menu_bar = self.menuBar()
         file_menu = menu_bar.addMenu("&File")
+        self._action(file_menu, "Open Project…", self.open_project, "Ctrl+Shift+O")
+        self._action(file_menu, "Save Project", self.save_project,
+                     QKeySequence.StandardKey.Save)
+        self._action(file_menu, "Save Project As…", self.save_project_as, "Ctrl+Shift+S")
+        file_menu.addSeparator()
         self._action(file_menu, "Open Data…", self.open_file_dialog,
                      QKeySequence.StandardKey.Open)
         self._action(file_menu, "Add Data (append)…",
@@ -457,6 +467,12 @@ class BioStatExplorer(QMainWindow):
         self._action(self.export_menu, "Data Table (CSV)…", self.export_data_csv)
         file_menu.addSeparator()
         self._action(file_menu, "Quit", self.close, QKeySequence.StandardKey.Quit)
+
+        edit_menu = menu_bar.addMenu("&Edit")
+        self.undo_action = self._action(edit_menu, "Undo", self.undo,
+                                        QKeySequence.StandardKey.Undo)
+        self.redo_action = self._action(edit_menu, "Redo", self.redo, "Ctrl+Shift+Z")
+        self._sync_undo_actions()
 
         view_menu = menu_bar.addMenu("&View")
         self.dark_action = QAction("Dark Mode", self, checkable=True)
@@ -1125,6 +1141,8 @@ class BioStatExplorer(QMainWindow):
         """
         if df is None or df.empty:
             return
+        if self.master_df is not None and not getattr(self, "_restoring", False):
+            self._push_undo()
         if source_label and "Source File" not in df.columns:
             df = df.copy()
             df["Source File"] = source_label
@@ -1398,23 +1416,28 @@ class BioStatExplorer(QMainWindow):
     # Plotting
     # ---------------------------------------------------------------
     def reset_group_colors(self):
+        self._push_undo()
         self.group_colors = {}
         self.update_plot()
 
     def reset_group_order(self):
+        self._push_undo()
         self.group_order = []
         self.hue_order = []
         self.update_plot()
 
     def _set_group_order(self, names):
+        self._push_undo()
         self.group_order = list(names)
         self.update_plot()
 
     def _set_series_order(self, names):
+        self._push_undo()
         self.hue_order = list(names)
         self.update_plot()
 
     def _set_group_color(self, name, color):
+        self._push_undo()
         if color:
             self.group_colors[name] = color
         else:
@@ -1451,6 +1474,7 @@ class BioStatExplorer(QMainWindow):
         self.groups_panel.set_groups(x_groups, series, shown, self.group_colors)
 
     def reset_custom_labels(self):
+        self._push_undo()
         self.custom_titles = {}
         self.custom_ylabels = {}
         self.custom_xlabel = None
@@ -1483,6 +1507,7 @@ class BioStatExplorer(QMainWindow):
                 initial = QColor(current) if current else QColor("white")
                 chosen = QColorDialog.getColor(initial, self, f"Choose color for '{group_name}'")
                 if chosen.isValid():
+                    self._push_undo()
                     self.group_colors[group_name] = chosen.name()
                     self.update_plot()
 
@@ -1491,6 +1516,7 @@ class BioStatExplorer(QMainWindow):
             current = self.custom_titles.get(metric, artist.get_text())
             text, ok = QInputDialog.getText(self, "Edit Graph Title", "Title:", text=current)
             if ok:
+                self._push_undo()
                 if text.strip():
                     self.custom_titles[metric] = text
                 else:
@@ -1501,6 +1527,7 @@ class BioStatExplorer(QMainWindow):
             current = self.custom_xlabel if self.custom_xlabel is not None else artist.get_text()
             text, ok = QInputDialog.getText(self, "Edit X-Axis Label", "X-axis label:", text=current)
             if ok:
+                self._push_undo()
                 self.custom_xlabel = text if text.strip() else None
                 self.update_plot()
 
@@ -1509,6 +1536,7 @@ class BioStatExplorer(QMainWindow):
             current = self.custom_ylabels.get(metric, artist.get_text())
             text, ok = QInputDialog.getText(self, "Edit Y-Axis Label", "Y-axis label:", text=current)
             if ok:
+                self._push_undo()
                 if text.strip():
                     self.custom_ylabels[metric] = text
                 else:
@@ -1563,6 +1591,7 @@ class BioStatExplorer(QMainWindow):
         else:
             return
 
+        self._push_undo()
         self.group_order = order
         self.update_plot()
 
@@ -1713,6 +1742,7 @@ class BioStatExplorer(QMainWindow):
         self.plot_figure.tight_layout()
         self.plot_canvas.draw()
         self._refresh_groups_panel(df, x_col, metrics[0], spec["hue"], spec["chart"])
+        self._mark_dirty()
 
     def update_summary_table_view(self, df=None):
         df = self.get_active_plot_df() if df is None else df
@@ -1734,6 +1764,7 @@ class BioStatExplorer(QMainWindow):
     def _add_column_to_data(self, make):
         """Apply *make(df) -> df* (which adds a column) to the full dataset,
         so the new column survives changing filters, then re-filter."""
+        self._push_undo()
         self.master_df = make(self.master_df.copy())
         self.filtered_df = FilterEngine.apply_multi_filter(
             self.master_df, self.dock_filter_selections)
@@ -1853,6 +1884,263 @@ class BioStatExplorer(QMainWindow):
                 "Omnibus": r.omnibus})
         return out
 
+    # ---------------------------------------------------------------
+    # Projects (.bse) and undo: both use the full state
+    # ---------------------------------------------------------------
+    def _plate_state(self):
+        return {"size": self.plate_size_selector.currentText(),
+                "values": {n: e.get_grid_values() for n, e in self.value_layer_editors.items()},
+                "maps": {n: e.get_grid_values() for n, e in self.map_layer_editors.items()},
+                "series": [dict(p) for p in getattr(self, "plate_series", [])],
+                "norm": self._plate_norm_state() if hasattr(self, "_plate_norm_state") else {}}
+
+    def _restore_plate(self, st):
+        if not st:
+            return
+        for tabs, editors in ((self.value_layers_tabs, self.value_layer_editors),
+                              (self.map_layers_tabs, self.map_layer_editors)):
+            while tabs.count():
+                tabs.removeTab(0)
+            editors.clear()
+        self.plate_size_selector.blockSignals(True)
+        self.plate_size_selector.setCurrentText(st.get("size", "96-well (8x12)"))
+        self.plate_size_selector.blockSignals(False)
+        for key, tabs, editors in (("values", self.value_layers_tabs, self.value_layer_editors),
+                                   ("maps", self.map_layers_tabs, self.map_layer_editors)):
+            for name, cells in st.get(key, {}).items():
+                ed = self._new_plate_grid_tab(tabs, editors, name)
+                if ed is not None:
+                    ed.set_cells(cells)
+        self.plate_series = [dict(p) for p in st.get("series", [])]
+        if hasattr(self, "_restore_plate_norm"):
+            self._restore_plate_norm(st.get("norm", {}))
+        if hasattr(self, "_refresh_series_label"):
+            self._refresh_series_label()
+
+    def state(self, for_file=False):
+        """Everything needed to rebuild this analysis."""
+        df = self.master_df
+        return {
+            "data": project.frame_to_json(df) if for_file else (None if df is None else df.copy()),
+            "spec": self.plot_spec(),
+            "dock_filters": {k: list(v) for k, v in self.dock_filter_selections.items()},
+            "plate": self._plate_state(),
+            "layout": self.layout_tab.to_list() if hasattr(self, "layout_tab") else [],
+            "curves": self.curves_tab.to_dict() if hasattr(self, "curves_tab") else {},
+        }
+
+    def apply_state(self, st):
+        self._restoring = True
+        try:
+            data = st.get("data")
+            df = project.frame_from_json(data) if isinstance(data, dict) else data
+            if df is not None and not df.empty:
+                self.ingest_dataframe(df.copy(), append=False)
+            else:
+                self.master_df = self.filtered_df = None
+            self.dock_filter_selections = {k: list(v) for k, v in
+                                           st.get("dock_filters", {}).items()}
+            if self.master_df is not None:
+                self.filtered_df = FilterEngine.apply_multi_filter(
+                    self.master_df, self.dock_filter_selections)
+                self.display_data(self.filtered_df)
+            self._apply_spec(st.get("spec", {}))
+            self._restore_plate(st.get("plate"))
+            if hasattr(self, "layout_tab"):
+                self.layout_tab.from_list(st.get("layout", []))
+            if hasattr(self, "curves_tab"):
+                self.curves_tab.from_dict(st.get("curves", {}))
+        finally:
+            self._restoring = False
+        self.update_plot()
+
+    def _apply_spec(self, sp):
+        if not sp:
+            return
+        widgets = [self.chart_selector, self.x_selector, self.y_selector, self.hue_selector,
+                   self.reference_selector, self.pairing_selector, self.palette_selector,
+                   self.stat_mode_selector]
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            for combo, key in ((self.chart_selector, "chart"), (self.x_selector, "x"),
+                               (self.y_selector, "y"), (self.palette_selector, "palette"),
+                               (self.stat_mode_selector, "stat")):
+                if sp.get(key) and combo.findText(sp[key]) >= 0:
+                    combo.setCurrentText(sp[key])
+            self.rebuild_hue_and_pairing_selectors()
+            self.rebuild_reference_selector()
+            for combo, key in ((self.hue_selector, "hue"), (self.reference_selector, "reference"),
+                               (self.pairing_selector, "pairing")):
+                v = sp.get(key) or NO_SELECTION
+                combo.setCurrentText(v if combo.findText(v) >= 0 else NO_SELECTION)
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+        checks = ((self.show_all_metrics_cb, "all_metrics"), (self.normalize_ref_cb, "normalize"),
+                  (self.log_scale_cb, "log"), (self.bw_mode_cb, "bw"),
+                  (self.show_pvalue_cb, "show_p"), (self.show_ns_cb, "show_ns"),
+                  (self.exclude_outliers_cb, "exclude_outliers"))
+        for cb, key in checks:
+            cb.blockSignals(True)
+            cb.setChecked(bool(sp.get(key)))
+            cb.blockSignals(False)
+        self.hist_bins_spin.blockSignals(True)
+        self.hist_bins_spin.setValue(int(sp.get("bins", 20)))
+        self.hist_bins_spin.blockSignals(False)
+        rng = sp.get("y_range")
+        vals = rng or sp.get("y_range_values") or [0.0, 100.0]
+        self.manual_yrange_cb.blockSignals(True)
+        self.manual_yrange_cb.setChecked(rng is not None)
+        self.manual_yrange_cb.blockSignals(False)
+        for spin, v in zip((self.y_min_spin, self.y_max_spin), vals):
+            spin.blockSignals(True)
+            spin.setValue(float(v))
+            spin.blockSignals(False)
+        brk = sp.get("axis_break")
+        self.axis_break_cb.blockSignals(True)
+        self.axis_break_cb.setChecked(brk is not None)
+        self.axis_break_cb.blockSignals(False)
+        if brk:
+            for spin, v in zip((self.axis_break_left_min, self.axis_break_left_max,
+                                self.axis_break_right_min, self.axis_break_right_max), brk):
+                spin.blockSignals(True)
+                spin.setValue(float(v))
+                spin.blockSignals(False)
+        self.group_colors = dict(sp.get("group_colors", {}))
+        self.group_order = list(sp.get("group_order", []))
+        self.hue_order = list(sp.get("hue_order", []))
+        self.custom_titles = dict(sp.get("titles", {}))
+        self.custom_xlabel = sp.get("xlabel")
+        self.custom_ylabels = dict(sp.get("ylabels", {}))
+        filters = sp.get("filters", {})
+        for col, lst in self.metadata_checklists.items():
+            if col not in filters:
+                continue
+            keep = set(filters[col])
+            lst.blockSignals(True)
+            for i in range(lst.count()):
+                it = lst.item(i)
+                it.setCheckState(Qt.CheckState.Checked if it.text() in keep
+                                 else Qt.CheckState.Unchecked)
+            lst.blockSignals(False)
+        self._sync_control_visibility()
+
+    # --- undo ---
+    UNDO_LIMIT = 30
+
+    def _push_undo(self):
+        if getattr(self, "_restoring", False) or getattr(self, "_building", False):
+            return
+        self._undo_stack.append(self.state())
+        del self._undo_stack[:-self.UNDO_LIMIT]
+        self._redo_stack.clear()
+        self._sync_undo_actions()
+        self._mark_dirty()
+
+    def _sync_undo_actions(self):
+        if hasattr(self, "undo_action"):
+            self.undo_action.setEnabled(bool(self._undo_stack))
+            self.redo_action.setEnabled(bool(self._redo_stack))
+
+    def undo(self):
+        if not self._undo_stack:
+            return
+        self._redo_stack.append(self.state())
+        self.apply_state(self._undo_stack.pop())
+        self._sync_undo_actions()
+        self.status_bar.showMessage("Undone", 2500)
+
+    def redo(self):
+        if not self._redo_stack:
+            return
+        self._undo_stack.append(self.state())
+        self.apply_state(self._redo_stack.pop())
+        self._sync_undo_actions()
+        self.status_bar.showMessage("Redone", 2500)
+
+    # --- project files ---
+    def _update_title(self):
+        name = os.path.basename(self._project_path) if self._project_path else "Untitled"
+        self.setWindowTitle(f"{name}[*] — BioStat Explorer")
+        self.setWindowModified(self._dirty)
+
+    def _mark_dirty(self):
+        if getattr(self, "_restoring", False) or getattr(self, "_building", False):
+            return
+        if self.master_df is not None and not self._dirty:
+            self._dirty = True
+            self._update_title()
+
+    def save_project(self):
+        if not self._project_path:
+            return self.save_project_as()
+        try:
+            project.save(self._project_path, self.state(for_file=True))
+        except Exception as e:
+            QMessageBox.warning(self, "Save failed", str(e))
+            return False
+        self._dirty = False
+        self._update_title()
+        self.status_bar.showMessage(f"Saved {os.path.basename(self._project_path)}", 4000)
+        return True
+
+    def save_project_as(self):
+        path = self._save_path("Save Project", "analysis.bse", "bse", project.FILTER)
+        if not path:
+            return False
+        self._project_path = path
+        return self.save_project()
+
+    def open_project(self, path=None):
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(self, "Open Project", self._last_dir(),
+                                                  project.FILTER)
+            if not path:
+                return
+        if not self._confirm_discard():
+            return
+        try:
+            st = project.load(path)
+        except Exception as e:
+            QMessageBox.warning(self, "Could not open", str(e))
+            return
+        self._remember_dir(path)
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self.apply_state(st)
+        self._project_path = path
+        self._dirty = False
+        self._sync_undo_actions()
+        self._update_title()
+        self.tabs.setCurrentWidget(self.graph_tab)
+        self.status_bar.showMessage(f"Opened {os.path.basename(path)}", 4000)
+
+    def _confirm_discard(self):
+        if not self._dirty or self.master_df is None:
+            return True
+        name = os.path.basename(self._project_path) if self._project_path else "this analysis"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Save changes?")
+        box.setText(f"Save the changes to {name}?")
+        box.setInformativeText("Your data, graph settings, colours, plate grids and layout "
+                               "are kept in a project file you can reopen later.")
+        box.setStandardButtons(QMessageBox.StandardButton.Save |
+                               QMessageBox.StandardButton.Discard |
+                               QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(QMessageBox.StandardButton.Save)
+        answer = box.exec()
+        if answer == QMessageBox.StandardButton.Save:
+            return self.save_project()
+        return answer == QMessageBox.StandardButton.Discard
+
+    def closeEvent(self, event):
+        if not self._confirm_discard():
+            event.ignore()
+            return
+        super().closeEvent(event)
+
     def _save_path(self, title, default_name, ext, filt):
         start = os.path.join(self._last_dir(), default_name)
         path, _ = QFileDialog.getSaveFileName(self, title, start, filt)
@@ -1958,4 +2246,7 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = BioStatExplorer()
     window.show()
+    for arg in sys.argv[1:]:
+        if arg.lower().endswith(".bse"):
+            window.open_project(arg)
     sys.exit(app.exec())
