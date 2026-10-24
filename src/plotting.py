@@ -65,6 +65,11 @@ class PlottingEngine:
         if df is None or df.empty or not x_col or not y_col:
             ax.text(0.5, 0.5, "Select X and Y variables to plot", ha='center', va='center', transform=ax.transAxes, color=text_color)
             return
+        if x_col == y_col:
+            ax.text(0.5, 0.5, f"'{x_col}' is both the X axis and the Metric —\n"
+                    "choose a different Metric", ha='center', va='center',
+                    transform=ax.transAxes, color=text_color)
+            return
 
         # light horizontal guide lines behind the data
         ax.set_axisbelow(True)

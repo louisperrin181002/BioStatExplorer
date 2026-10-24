@@ -22,7 +22,7 @@ from src.excel_loader import DataLoader, sheet_names, read_grid
 from src.plotting import PlottingEngine, PALETTE_NAMES, palette_colors
 from src.groups_panel import GroupsPanel
 from src.filters import FilterEngine
-from src.normalization import NormalizationEngine
+from src.normalization import NormalizationEngine, plate_normalise
 from src.statistics_engine import StatisticsEngine, format_p, stars
 from src.utils import SummaryStatistics
 from src.export_engine import ExportEngine
@@ -861,6 +861,49 @@ class BioStatExplorer(QMainWindow):
 
         outer_layout.addLayout(splitter_layout, stretch=1)
 
+        # 3. series + corrections
+        extra = QHBoxLayout()
+        series_box = QGroupBox("Plates")
+        sl = QHBoxLayout(series_box)
+        self.series_label = QLabel("One plate (the grids above).")
+        self.series_label.setWordWrap(True)
+        sl.addWidget(self.series_label, 1)
+        self.series_combo = QComboBox()
+        self.series_combo.setToolTip("Which plate of the series the grids show")
+        self.series_combo.currentIndexChanged.connect(self._show_series_plate)
+        sl.addWidget(self.series_combo)
+        times_btn = QPushButton("Names && Times…")
+        times_btn.clicked.connect(self._edit_series_times)
+        self._series_widgets = [self.series_combo, times_btn]
+        sl.addWidget(times_btn)
+        extra.addWidget(series_box, 1)
+
+        norm_box = QGroupBox("3. Corrections (optional)")
+        nl = QGridLayout(norm_box)
+        self.blank_cb = QCheckBox("Subtract blanks: wells labelled")
+        self.blank_label_edit = QLineEdit("blank")
+        self.blank_label_edit.setMaximumWidth(120)
+        self.blank_label_edit.setToolTip("Label of the blank wells in the plate map "
+                                         "(several: separate with commas)")
+        self.blank_layer_combo = QComboBox()
+        self.blank_match_combo = QComboBox()
+        self.blank_match_combo.setToolTip("e.g. Medium: each well gets the blank of its own "
+                                          "medium")
+        nl.addWidget(self.blank_cb, 0, 0)
+        nl.addWidget(self.blank_label_edit, 0, 1)
+        nl.addWidget(QLabel("in"), 0, 2)
+        nl.addWidget(self.blank_layer_combo, 0, 3)
+        nl.addWidget(QLabel("matched by"), 0, 4)
+        nl.addWidget(self.blank_match_combo, 0, 5)
+        self.od_cb = QCheckBox("Divide every readout by")
+        self.od_combo = QComboBox()
+        nl.addWidget(self.od_cb, 1, 0)
+        nl.addWidget(self.od_combo, 1, 1, 1, 3)
+        self.keep_blanks_cb = QCheckBox("Keep blank wells in the data")
+        nl.addWidget(self.keep_blanks_cb, 1, 4, 1, 2)
+        extra.addWidget(norm_box, 2)
+        outer_layout.addLayout(extra)
+
         build_bar = QHBoxLayout()
         build_btn = QPushButton("Build Dataset From Plate")
         build_btn.setObjectName("primaryBtn")
@@ -876,6 +919,9 @@ class BioStatExplorer(QMainWindow):
         # Start with one sensible default of each so the tab isn't empty
         self._new_plate_grid_tab(self.value_layers_tabs, self.value_layer_editors, "Value")
         self._new_plate_grid_tab(self.map_layers_tabs, self.map_layer_editors, "Strain")
+        self.plate_series = []
+        self._series_index = 0
+        self._refresh_series_label()
 
     def on_plate_size_changed(self, size_name):
         n_rows, n_cols = pr.PLATE_SHAPES[size_name]
@@ -893,6 +939,7 @@ class BioStatExplorer(QMainWindow):
         editor = PlateGridEditor(n_rows, n_cols)
         editors_dict[name] = editor
         tabs_widget.addTab(editor, name)
+        self._refresh_norm_choices()
         return editor
 
     def add_plate_value_layer(self):
@@ -913,6 +960,7 @@ class BioStatExplorer(QMainWindow):
         name = self.value_layers_tabs.tabText(idx)
         self.value_layers_tabs.removeTab(idx)
         self.value_layer_editors.pop(name, None)
+        self._refresh_norm_choices()
 
     def add_plate_map_layer(self):
         name = self.layer_name_edit.text().strip()
@@ -932,22 +980,27 @@ class BioStatExplorer(QMainWindow):
         name = self.map_layers_tabs.tabText(idx)
         self.map_layers_tabs.removeTab(idx)
         self.map_layer_editors.pop(name, None)
+        self._refresh_norm_choices()
 
     @staticmethod
     def _grid_is_empty(editor):
         return all(not v.strip() for row in editor.get_grid_values() for v in row)
 
     def import_plate_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Import Plate-Reader File",
-                                              self._last_dir(), DATA_FILTER)
-        if not path:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Import Plate-Reader File(s) — select several for a time series",
+            self._last_dir(), DATA_FILTER)
+        if not paths:
             return
-        self._remember_dir(path)
-        sheet, ok = self._choose_sheet(path, "plate grids")
+        self._remember_dir(paths[0])
+        paths = sorted(paths, key=lambda p_: (pr.hours_in_name(os.path.basename(p_)) is None,
+                                              pr.hours_in_name(os.path.basename(p_)) or 0,
+                                              os.path.basename(p_).lower()))
+        sheet, ok = self._choose_sheet(paths[0], "plate grids")
         if not ok:
             return
         try:
-            blocks = pr.find_plate_blocks(read_grid(path, sheet))
+            blocks = pr.find_plate_blocks(read_grid(paths[0], sheet))
         except Exception as e:
             QMessageBox.warning(self, "Could not read", str(e))
             return
@@ -958,31 +1011,239 @@ class BioStatExplorer(QMainWindow):
                 "C… beside them) was found. If this file is a plain table (one row "
                 "per sample), use Open Data instead.")
             return
-        dlg = PlateImportDialog(blocks, path, self)
+        dlg = PlateImportDialog(blocks, paths[0], self)
+        if len(paths) > 1:
+            dlg.setWindowTitle(f"Import {len(paths)} Plates — choose the grids "
+                               "(the same ones are taken from every file)")
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         chosen = dlg.chosen()
         if not chosen:
             return
+        self._push_undo()
         shape = pr.shape_name(max(b["n_rows"] for b, _, _ in chosen),
                               max(b["n_cols"] for b, _, _ in chosen))
         if shape != self.plate_size_selector.currentText():
             self.plate_size_selector.setCurrentText(shape)
+        # plate maps go straight into the map grids
         for block, name, is_map in chosen:
-            editors = self.map_layer_editors if is_map else self.value_layer_editors
-            tabs = self.map_layers_tabs if is_map else self.value_layers_tabs
-            # an untouched default grid makes way for the imported ones
-            for old in [n for n, e in editors.items() if n in ("Value", "Strain")
-                        and n != name and self._grid_is_empty(e)]:
-                tabs.removeTab(tabs.indexOf(editors.pop(old)))
-            editor = editors.get(name) or self._new_plate_grid_tab(tabs, editors, name)
-            editor.set_cells(block["cells"])
-            tabs.setCurrentWidget(editor)
+            if is_map:
+                for old in [n for n, e in self.map_layer_editors.items()
+                            if n == "Strain" and n != name and self._grid_is_empty(e)]:
+                    self.map_layers_tabs.removeTab(
+                        self.map_layers_tabs.indexOf(self.map_layer_editors.pop(old)))
+                ed = self.map_layer_editors.get(name) or self._new_plate_grid_tab(
+                    self.map_layers_tabs, self.map_layer_editors, name)
+                ed.set_cells(block["cells"])
+        readouts = [(b, n) for b, n, is_map in chosen if not is_map]
+        series, problems, matched = [], [], []
+        for i, path in enumerate(paths):
+            if i == 0:
+                file_blocks = [b for b, _ in readouts]
+            else:
+                try:
+                    file_blocks = pr.match_blocks([b for b, _ in readouts],
+                                                  pr.find_plate_blocks(read_grid(path, sheet)
+                                                                       if sheet in sheet_names(path)
+                                                                       else read_grid(path)))
+                except Exception as e:
+                    problems.append(f"{os.path.basename(path)}: {e}")
+                    continue
+            vals = {}
+            for (ref, name), b in zip(readouts, file_blocks):
+                if b is None:
+                    problems.append(f"{os.path.basename(path)}: no grid like '{ref['title']}'")
+                    continue
+                if b["title"] != ref["title"]:
+                    matched.append(f"{os.path.basename(path)}: '{b['title']}' used as "
+                                   f"{name} (first file: '{ref['title']}')")
+                vals[name] = b["cells"]
+            stem = os.path.splitext(os.path.basename(path))[0]
+            series.append({"name": stem, "time": pr.hours_in_name(stem), "values": vals,
+                           "saturated": sum(b["saturated"] for b in file_blocks if b)})
+        # more readouts for plates already loaded (e.g. the OD files after the
+        # GFP/mKate files of the same time points)?
+        new_names = {name for _, name in readouts}
+        old_times = {p_.get("time") for p_ in self.plate_series}
+        if len(series) > 1 and self.plate_series and (
+                {p_["time"] for p_ in series} <= old_times or len(series) == len(self.plate_series)):
+            have = new_names & set(self.plate_series[0]["values"])
+            ans = QMessageBox.question(
+                self, "Add to the plates already loaded?",
+                f"{len(self.plate_series)} plates are already loaded. Add "
+                f"{', '.join(sorted(new_names))} to them (matched by time point, or "
+                "by order), instead of starting a new series?"
+                + (f"\n\n{', '.join(sorted(have))} will be replaced by the new files' "
+                   "values." if have else ""),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes)
+            if ans == QMessageBox.StandardButton.Yes:
+                self._store_series_plate()
+                unmatched = []
+                for i, new in enumerate(series):
+                    old = next((o_ for o_ in self.plate_series if new["time"] is not None
+                                and o_.get("time") == new["time"]), None)
+                    if old is None and new["time"] is None and i < len(self.plate_series):
+                        old = self.plate_series[i]
+                    if old is None:
+                        unmatched.append(new["name"])
+                        continue
+                    old["values"].update(new["values"])
+                for name in sorted(new_names):
+                    if name not in self.value_layer_editors:
+                        self._new_plate_grid_tab(self.value_layers_tabs,
+                                                 self.value_layer_editors, name)
+                self._load_series_plate(self._series_index,
+                                        self.plate_series[self._series_index]["values"])
+                self._refresh_norm_choices()
+                self.tabs.setCurrentWidget(self.plate_tab)
+                self.status_bar.showMessage(
+                    f"Added {', '.join(sorted(new_names))} to {len(series) - len(unmatched)} "
+                    "plates", 10000)
+                if unmatched:
+                    QMessageBox.warning(self, "Not matched",
+                                        "No loaded plate with the same time point for:\n"
+                                        + "\n".join(unmatched))
+                return
+        for name in [n for n, e in self.value_layer_editors.items() if n == "Value"
+                     and self._grid_is_empty(e) and n not in new_names]:
+            self.value_layers_tabs.removeTab(
+                self.value_layers_tabs.indexOf(self.value_layer_editors.pop(name)))
+        for _, name in readouts:
+            if name not in self.value_layer_editors:
+                self._new_plate_grid_tab(self.value_layers_tabs, self.value_layer_editors, name)
+        self.plate_series = series if len(series) > 1 else []
+        self._series_index = 0
+        self._load_series_plate(0, series[0]["values"] if series else {})
+        self._refresh_series_label()
+        self._refresh_norm_choices()
         self.tabs.setCurrentWidget(self.plate_tab)
-        warn = [f"{n}: {b['saturated']} saturated wells" for b, n, _ in chosen if b["saturated"]]
+        warn = [f"{p_['name']}: {p_['saturated']} saturated wells" for p_ in series
+                if p_["saturated"]]
         self.status_bar.showMessage(
-            f"Imported {len(chosen)} grid(s) from {os.path.basename(path)}"
-            + (" — " + "; ".join(warn) if warn else ""), 10000)
+            f"Imported {len(chosen)} grid(s) from {len(paths)} file(s)"
+            + (" — " + "; ".join(warn) if warn else ""), 12000)
+        if problems:
+            QMessageBox.warning(self, "Some grids were not found", "\n".join(problems[:20]))
+        if matched:
+            QMessageBox.information(
+                self, "Check the matched grids",
+                "These files name their grids differently, so they were matched by "
+                "position — please check they measure the same thing:\n\n"
+                + "\n".join(matched[:20]))
+
+    # --- plate series (several files, e.g. 8 h / 16 h / 24 h) ---
+    def _load_series_plate(self, index, values):
+        for name, cells in values.items():
+            ed = self.value_layer_editors.get(name)
+            if ed is not None:
+                ed.clear_grid()
+                ed.set_cells(cells)
+
+    def _store_series_plate(self):
+        """Keep edits made in the grids for the plate shown."""
+        if self.plate_series and 0 <= self._series_index < len(self.plate_series):
+            self.plate_series[self._series_index]["values"] = {
+                n: e.get_grid_values() for n, e in self.value_layer_editors.items()}
+
+    def _show_series_plate(self, index):
+        if not self.plate_series or index < 0 or index == self._series_index:
+            return
+        self._store_series_plate()
+        self._series_index = index
+        self._load_series_plate(index, self.plate_series[index]["values"])
+
+    @staticmethod
+    def _series_title(p_):
+        return p_["name"] + (f"  ({p_['time']:g} h)" if p_.get("time") is not None else "")
+
+    def _refresh_series_label(self):
+        n = len(self.plate_series)
+        for w in self._series_widgets:
+            w.setVisible(n > 1)
+        if n > 1:
+            times = [p_["time"] for p_ in self.plate_series if p_.get("time") is not None]
+            self.series_label.setText(
+                f"<b>{n} plates</b> — one plate map for all; each plate becomes a "
+                "'Plate' value" + (", with a 'Time (h)' column" if times else "")
+                + ". The grids show:")
+            self.series_combo.blockSignals(True)
+            self.series_combo.clear()
+            self.series_combo.addItems([self._series_title(p_) for p_ in self.plate_series])
+            self.series_combo.setCurrentIndex(self._series_index)
+            self.series_combo.blockSignals(False)
+        else:
+            self.series_label.setText("One plate (the grids above). To analyse several "
+                                      "plates (e.g. 8 h, 16 h, 24 h), select all their files "
+                                      "in Import Plate-Reader File….")
+
+    def _edit_series_times(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Plate Names and Times")
+        lay = QVBoxLayout(dlg)
+        t = QTableWidget(len(self.plate_series), 2)
+        t.setHorizontalHeaderLabels(["Plate", "Time (h) — empty if none"])
+        t.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for i, p_ in enumerate(self.plate_series):
+            t.setItem(i, 0, QTableWidgetItem(p_["name"]))
+            t.setItem(i, 1, QTableWidgetItem("" if p_.get("time") is None else f"{p_['time']:g}"))
+        lay.addWidget(t)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                              QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+        dlg.resize(520, 320)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._push_undo()
+        for i, p_ in enumerate(self.plate_series):
+            p_["name"] = t.item(i, 0).text().strip() or p_["name"]
+            txt = t.item(i, 1).text().strip().replace(",", ".")
+            try:
+                p_["time"] = float(txt) if txt else None
+            except ValueError:
+                pass
+        self._refresh_series_label()
+
+    # --- corrections ---
+    def _refresh_norm_choices(self):
+        if not hasattr(self, "blank_layer_combo"):
+            return
+        maps = list(self.map_layer_editors)
+        for combo, items in ((self.blank_layer_combo, maps),
+                             (self.blank_match_combo, ["(whole plate)"] + maps),
+                             (self.od_combo, list(self.value_layer_editors))):
+            cur = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(items)
+            od_like = lambda n_: "od" in n_.lower() or "600" in n_
+            if cur in items and not (combo is self.od_combo and not od_like(cur)):
+                combo.setCurrentText(cur)
+            elif combo is self.od_combo:
+                od = next((n for n in items if "od" in n.lower() or "600" in n), None)
+                if od:
+                    combo.setCurrentText(od)
+            combo.blockSignals(False)
+
+    def _plate_norm_state(self):
+        return {"blank": self.blank_cb.isChecked(), "label": self.blank_label_edit.text(),
+                "layer": self.blank_layer_combo.currentText(),
+                "match": self.blank_match_combo.currentText(),
+                "od": self.od_cb.isChecked(), "od_col": self.od_combo.currentText(),
+                "keep_blanks": self.keep_blanks_cb.isChecked()}
+
+    def _restore_plate_norm(self, st):
+        self._refresh_norm_choices()
+        self.blank_cb.setChecked(bool(st.get("blank")))
+        self.blank_label_edit.setText(st.get("label", "blank"))
+        for combo, key in ((self.blank_layer_combo, "layer"), (self.blank_match_combo, "match"),
+                           (self.od_combo, "od_col")):
+            if st.get(key) and combo.findText(st[key]) >= 0:
+                combo.setCurrentText(st[key])
+        self.od_cb.setChecked(bool(st.get("od")))
+        self.keep_blanks_cb.setChecked(bool(st.get("keep_blanks")))
 
     def build_dataset_from_plate(self):
         n_rows, n_cols = pr.PLATE_SHAPES[self.plate_size_selector.currentText()]
@@ -990,28 +1251,46 @@ class BioStatExplorer(QMainWindow):
         if not self.value_layer_editors:
             QMessageBox.warning(self, "No value grids", "Add at least one raw value grid first (e.g. 'GFP').")
             return
-
-        value_dfs = []
-        for name, editor in self.value_layer_editors.items():
-            grid = editor.get_grid_values()
-            value_dfs.append(pr.grid_to_long(grid, value_name=name, n_rows=n_rows, n_cols=n_cols))
-
-        merged_values = value_dfs[0]
-        for vdf in value_dfs[1:]:
-            merged_values = merged_values.merge(vdf, on=["Well", "Row", "Column"], how="outer")
-
         metric_names = list(self.value_layer_editors.keys())
-        if merged_values[metric_names].dropna(how="all").empty:
-            QMessageBox.warning(self, "No values found",
-                "All raw plate value grids are empty. Type values in, or use 'Load From File...' first.")
-            return
+        self._store_series_plate()
+        plates = self.plate_series or [{"name": None, "time": None, "values": {
+            n: e.get_grid_values() for n, e in self.value_layer_editors.items()}}]
 
         layer_dfs = []
         for name, editor in self.map_layer_editors.items():
             grid = editor.get_grid_values()
             layer_dfs.append(pr.map_grid_to_long(grid, name, n_rows, n_cols))
 
-        merged = pr.merge_well_layers(merged_values, layer_dfs)
+        frames = []
+        for plate in plates:
+            value_dfs = [pr.grid_to_long(plate["values"].get(name, [[""] * n_cols] * n_rows),
+                                         value_name=name, n_rows=n_rows, n_cols=n_cols)
+                         for name in metric_names]
+            merged_values = value_dfs[0]
+            for vdf in value_dfs[1:]:
+                merged_values = merged_values.merge(vdf, on=["Well", "Row", "Column"], how="outer")
+            merged = pr.merge_well_layers(merged_values, layer_dfs)
+            if plate["name"] is not None:
+                merged.insert(0, "Plate", plate["name"])
+                if any(p_.get("time") is not None for p_ in plates):
+                    merged.insert(1, "Time (h)", plate.get("time"))
+            frames.append(merged)
+        merged = pd.concat(frames, ignore_index=True)
+        if merged[metric_names].dropna(how="all").empty:
+            QMessageBox.warning(self, "No values found",
+                "All raw plate value grids are empty. Type values in, or use 'Load From File...' first.")
+            return
+
+        notes = []
+        blank_col = self.blank_layer_combo.currentText() if self.blank_cb.isChecked() else None
+        od = self.od_combo.currentText() if self.od_cb.isChecked() else None
+        if blank_col or od:
+            match = self.blank_match_combo.currentText()
+            merged, notes = plate_normalise(
+                merged, metric_names, blank_col, self.blank_label_edit.text(),
+                match_col=None if match == "(whole plate)" else match,
+                plate_col="Plate" if "Plate" in merged else None, od=od,
+                keep_blanks=self.keep_blanks_cb.isChecked())
         # empty wells (no reading at all) aren't samples
         merged = merged.dropna(subset=metric_names, how="all").reset_index(drop=True)
 
@@ -1028,6 +1307,9 @@ class BioStatExplorer(QMainWindow):
 
         self.ingest_dataframe(merged, append=append, source_label="Plate Reader Import")
         self.tabs.setCurrentWidget(self.graph_tab)
+        if notes:
+            self.status_bar.showMessage(" ".join(notes[:3]), 15000)
+        self.last_plate_notes = notes
 
     def init_dock_panels(self):
         self.dock = QDockWidget("Filters", self)
@@ -1205,6 +1487,11 @@ class BioStatExplorer(QMainWindow):
         self.x_selector.addItems(cols)
         # Prefer numeric metric columns for the Metric dropdown, if any exist
         metric_candidates = [c for c in getattr(self, 'metric_cols', []) if c in cols] or cols
+        # readings first; time / position / raw columns last
+        late = lambda c: (c.lower().startswith(("time", "row", "column", "replicate", "rep"))
+                          or c.endswith("(raw)"))
+        metric_candidates = [c for c in metric_candidates if not late(c)] + \
+            [c for c in metric_candidates if late(c)]
         self.y_selector.addItems(metric_candidates)
         x = old_x if (old_x in cols and not choose_defaults) else (
             self._default_x() if self.master_df is not None else None)

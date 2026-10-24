@@ -269,3 +269,28 @@ def shape_name(n_rows, n_cols):
         if n_rows <= r and n_cols <= c:
             return name
     return "384-well (16x24)"
+
+
+def hours_in_name(name):
+    """Time point written in a file name: '16h incubation' -> 16.0,
+    '30 min' -> 0.5; None if there is none."""
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*h(?:ours?|rs?)?(?![a-z])", name, re.I)
+    if m:
+        return float(m.group(1).replace(",", "."))
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*days?\b", name, re.I)
+    if m:
+        return float(m.group(1).replace(",", ".")) * 24
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*min", name, re.I)
+    if m:
+        return float(m.group(1).replace(",", ".")) / 60
+    return None
+
+
+def match_blocks(reference, blocks):
+    """For each block of the first file (*reference*), the block of another
+    file with the same title (or, failing that, at the same position)."""
+    by_title = {b["title"]: b for b in blocks}
+    out = []
+    for i, ref in enumerate(reference):
+        out.append(by_title.get(ref["title"]) or (blocks[i] if i < len(blocks) else None))
+    return out
