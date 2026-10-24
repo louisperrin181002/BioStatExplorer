@@ -184,6 +184,9 @@ class PlateGridEditor(QWidget):
         self.table.setColumnCount(n_cols)
         self.table.setVerticalHeaderLabels([pr.well_id(r, 0)[:-1] for r in range(n_rows)])
         self.table.setHorizontalHeaderLabels([str(c + 1) for c in range(n_cols)])
+        # every column visible without scrolling sideways
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setMinimumSectionSize(28)
         for r in range(n_rows):
             for c in range(n_cols):
                 if self.table.item(r, c) is None:
@@ -749,7 +752,7 @@ class BioStatExplorer(QMainWindow):
         self.init_plate_reader_tab()
 
         self.tabs.addTab(self.data_tab, "Data Viewer")
-        self.tabs.addTab(self.plate_tab, "Plate Reader Import")
+        self.tabs.addTab(self.plate_tab, "Plate")
         self.tabs.addTab(self.graph_tab, "Plotting Dashboard")
         self.tabs.addTab(self.analysis_tab, "Statistical Analysis")
         self.setCentralWidget(self.tabs)
@@ -758,6 +761,12 @@ class BioStatExplorer(QMainWindow):
         self.plate_tab = QWidget()
         outer_layout = QVBoxLayout(self.plate_tab)
 
+        intro = QLabel("<b>Two ways to fill a plate:</b> type or paste the values by hand "
+                       "in the grids below (click a well and type, or paste a block from "
+                       "Excel), or <b>Import Plate-Reader File…</b> to fill them from an "
+                       "instrument export. You can mix both, and edit imported values.")
+        intro.setWordWrap(True)
+        outer_layout.addWidget(intro)
         top_bar = QHBoxLayout()
         top_bar.addWidget(QLabel("<b>Plate Size:</b>"))
         self.plate_size_selector = QComboBox()
