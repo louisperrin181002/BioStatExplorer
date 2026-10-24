@@ -666,6 +666,11 @@ class BioStatExplorer(QMainWindow):
         f.addRow("", self.show_pvalue_cb)
         self.show_ns_cb = check("Show non-significant (ns)")
         f.addRow("", self.show_ns_cb)
+        self.exclude_outliers_cb = check("Leave out outliers (Grubbs)")
+        self.exclude_outliers_cb.setToolTip(
+            "Grubbs' test (alpha 0.05) within each group; outliers are listed in "
+            "the report either way")
+        f.addRow("", self.exclude_outliers_cb)
         overlay_hint = QLabel("Stars use the same tests and corrections as the Statistical "
                               "Analysis tab. With Color by, colours are compared within "
                               "each X group.")
@@ -1590,12 +1595,87 @@ class BioStatExplorer(QMainWindow):
         ax_right.plot([0], [0], transform=ax_right.transAxes, **break_kwargs)
         ax_right.plot([0], [1], transform=ax_right.transAxes, **break_kwargs)
 
+    # ---------------------------------------------------------------
+    # The plot as a "spec": every setting in one dict. The live plot,
+    # layout panels, saved projects and undo all use it.
+    # ---------------------------------------------------------------
+    def plot_spec(self):
+        manual = self.manual_yrange_cb.isChecked()
+        brk = self.axis_break_cb.isChecked()
+        return {
+            "chart": self.chart_selector.currentText(),
+            "x": self.x_selector.currentText(),
+            "metrics": self.get_selected_metrics(),
+            "y": self.y_selector.currentText(),
+            "all_metrics": self.show_all_metrics_cb.isChecked(),
+            "hue": self.get_hue(),
+            "reference": self.get_reference(),
+            "pairing": self.get_pairing_col(),
+            "normalize": self.normalize_ref_cb.isChecked(),
+            "log": self.log_scale_cb.isChecked(),
+            "stat": self.stat_mode_selector.currentText(),
+            "bw": self.bw_mode_cb.isChecked(),
+            "bins": self.hist_bins_spin.value(),
+            "palette": self.palette_selector.currentText(),
+            "show_p": self.show_pvalue_cb.isChecked(),
+            "show_ns": self.show_ns_cb.isChecked(),
+            "y_range": [self.y_min_spin.value(), self.y_max_spin.value()] if manual else None,
+            "y_range_values": [self.y_min_spin.value(), self.y_max_spin.value()],
+            "axis_break": [self.axis_break_left_min.value(), self.axis_break_left_max.value(),
+                           self.axis_break_right_min.value(),
+                           self.axis_break_right_max.value()] if brk else None,
+            "group_colors": dict(self.group_colors),
+            "group_order": list(self.group_order),
+            "hue_order": list(self.hue_order),
+            "titles": dict(self.custom_titles),
+            "xlabel": self.custom_xlabel,
+            "ylabels": dict(self.custom_ylabels),
+            "filters": self.get_plot_filter_map(),
+            "exclude_outliers": getattr(self, "exclude_outliers_cb", None) is not None
+                                and self.exclude_outliers_cb.isChecked(),
+        }
+
+    @staticmethod
+    def draw_metric(ax, df, spec, metric, dark=False, status=None):
+        """Draw one metric of *spec* on *ax* (df already filtered).
+        Returns the y column actually drawn."""
+        x_col, y_col = spec["x"], metric
+        plot_df = df
+        if spec.get("exclude_outliers"):
+            plot_df = StatisticsEngine.drop_outliers(plot_df, x_col, metric,
+                                                     spec.get("hue"))
+        if spec.get("normalize"):
+            ref = spec.get("reference")
+            if ref:
+                plot_df = NormalizationEngine.wild_type_fold_change(
+                    plot_df.copy(), metric, x_col, wt_label=ref)
+                cand = f"{metric} (Fold Change)"
+                if cand in plot_df.columns:
+                    y_col = cand
+                elif status:
+                    status(f"Could not normalize '{metric}' to '{ref}' (no data / zero "
+                           "mean) — showing raw values.")
+            elif status:
+                status("Select a reference group in 'Compare to' to normalize.")
+        rng = spec.get("y_range")
+        PlottingEngine.generate_plot(
+            plot_df, spec["chart"], x_col, y_col, ax, dark_mode=dark,
+            palette=spec["palette"], stat_mode=spec["stat"], hue_col=spec.get("hue"),
+            log_scale=spec["log"], reference=spec.get("reference"),
+            pairing_col=spec.get("pairing"), show_pvalue=spec["show_p"],
+            y_min=rng[0] if rng else None, y_max=rng[1] if rng else None,
+            group_colors=spec["group_colors"], bw_mode=spec["bw"], hist_bins=spec["bins"],
+            custom_title=spec["titles"].get(y_col), custom_xlabel=spec.get("xlabel"),
+            custom_ylabel=spec["ylabels"].get(y_col), group_order=spec["group_order"],
+            show_ns=spec["show_ns"], hue_order=spec["hue_order"])
+        return y_col
+
     def update_plot(self):
         if getattr(self, "_building", False):
             return
         df = self.get_active_plot_df()
-        x_col = self.x_selector.currentText()
-        metrics = self.get_selected_metrics()
+        spec = self.plot_spec()
+        x_col, metrics = spec["x"], spec["metrics"]
 
         if df is None or df.empty or not x_col or not metrics:
             self.plot_figure.clf()
@@ -1605,21 +1685,9 @@ class BioStatExplorer(QMainWindow):
             self.plot_canvas.draw()
             return
 
-        hue_col = self.get_hue()
-        reference = self.get_reference()
-        pairing_col = self.get_pairing_col()
-        normalize = self.normalize_ref_cb.isChecked()
-        log_scale = self.log_scale_cb.isChecked()
-        chart_type = self.chart_selector.currentText()
-        stat_mode = self.stat_mode_selector.currentText()
-        bw_mode = self.bw_mode_cb.isChecked()
-        hist_bins = self.hist_bins_spin.value()
-        # Axis break (gap) only makes sense on a continuous, numeric X axis -
-        # i.e. Line plots - so it's ignored for categorical chart types.
-        use_axis_break = self.axis_break_cb.isChecked() and chart_type == "Line"
-
+        # Axis break (gap) only makes sense on a numeric X axis (Line plots)
+        use_axis_break = spec["axis_break"] is not None and spec["chart"] == "Line"
         self.plot_figure.clf()
-
         if use_axis_break:
             gs = self.plot_figure.add_gridspec(nrows=len(metrics), ncols=2, width_ratios=[1, 1], wspace=0.08)
             self.axes = []
@@ -1632,50 +1700,22 @@ class BioStatExplorer(QMainWindow):
         else:
             self.axes = self.plot_figure.subplots(nrows=len(metrics), ncols=1, squeeze=False)[:, 0].tolist()
         self.ax = self.axes[0]
-
+        status = lambda m: self.status_bar.showMessage(m, 5000)
         for idx, metric in enumerate(metrics):
-            plot_df = df
-            y_col = metric
-            if normalize:
-                if reference:
-                    plot_df = NormalizationEngine.wild_type_fold_change(df.copy(), metric, x_col, wt_label=reference)
-                    candidate_col = f"{metric} (Fold Change)"
-                    if candidate_col in plot_df.columns:
-                        y_col = candidate_col
-                    else:
-                        self.status_bar.showMessage(
-                            f"Could not normalize '{metric}' to '{reference}' (no data / zero mean) — showing raw values.", 5000)
-                else:
-                    self.status_bar.showMessage("Select a reference group in 'Compare To' to normalize.", 5000)
-
-            manual_yrange = self.manual_yrange_cb.isChecked()
-            plot_kwargs = dict(
-                dark_mode=self.is_dark_mode, palette=self.palette_selector.currentText(),
-                stat_mode=stat_mode, hue_col=hue_col, log_scale=log_scale,
-                reference=reference, pairing_col=pairing_col,
-                show_pvalue=self.show_pvalue_cb.isChecked(),
-                y_min=self.y_min_spin.value() if manual_yrange else None,
-                y_max=self.y_max_spin.value() if manual_yrange else None,
-                group_colors=self.group_colors, bw_mode=bw_mode, hist_bins=hist_bins,
-                custom_title=self.custom_titles.get(y_col), custom_xlabel=self.custom_xlabel,
-                custom_ylabel=self.custom_ylabels.get(y_col), group_order=self.group_order,
-                show_ns=self.show_ns_cb.isChecked(), hue_order=self.hue_order,
-            )
-
             if use_axis_break:
                 ax_left, ax_right = axis_pairs[idx]
-                PlottingEngine.generate_plot(plot_df, chart_type, x_col, y_col, ax_left, **plot_kwargs)
-                PlottingEngine.generate_plot(plot_df, chart_type, x_col, y_col, ax_right, **plot_kwargs)
+                self.draw_metric(ax_left, df, spec, metric, self.is_dark_mode, status)
+                self.draw_metric(ax_right, df, spec, metric, self.is_dark_mode, status)
                 self._apply_axis_break(ax_left, ax_right)
             else:
-                PlottingEngine.generate_plot(plot_df, chart_type, x_col, y_col, self.axes[idx], **plot_kwargs)
+                self.draw_metric(self.axes[idx], df, spec, metric, self.is_dark_mode, status)
 
         self.plot_figure.tight_layout()
         self.plot_canvas.draw()
-        self._refresh_groups_panel(df, x_col, metrics[0], hue_col, chart_type)
+        self._refresh_groups_panel(df, x_col, metrics[0], spec["hue"], spec["chart"])
 
-    def update_summary_table_view(self):
-        df = self.get_active_plot_df()
+    def update_summary_table_view(self, df=None):
+        df = self.get_active_plot_df() if df is None else df
         x_var = self.x_selector.currentText()
         metrics = self.get_selected_metrics()
         y_var = metrics[0] if metrics else None
@@ -1735,32 +1775,67 @@ class BioStatExplorer(QMainWindow):
             self.stats_output.setPlainText("Open data and choose an X axis and a "
                                            "Metric on the Plotting Dashboard first.")
             return
-        self.update_summary_table_view()
-
         test = self.stat_mode_selector.currentText()
         if test == StatisticsEngine.NONE:
             test = StatisticsEngine.AUTO
         hue = self.get_hue()
         order = self._current_group_order()
-        texts, rows = [], []
+        exclude = self.exclude_outliers_cb.isChecked()
+        texts, rows, tables = [], [], []
         for y_var in metrics:
-            if hue:
+            flags = StatisticsEngine.find_outliers(df, x_var, y_var, hue)
+            out_txt = self._outlier_text(df, flags, x_var, y_var, hue, exclude)
+            data = df[~flags] if exclude else df
+            if y_var == metrics[0]:
+                self.update_summary_table_view(data)
+            if test == StatisticsEngine.TWO_WAY and hue:
+                table, results = StatisticsEngine.two_way(data, x_var, hue, y_var, self.hue_order)
+                lines = ["=== TWO-WAY ANOVA ===", "",
+                         f"'{y_var}' by '{x_var}' and '{hue}' (type II sums of squares)", ""]
+                for t in table[:3]:
+                    lines.append(f"  - {t['Effect']}: F({t['df']:g}, {table[3]['df']:g}) = "
+                                 f"{t['F']:.3f}, {format_p(t['p'])} {stars(t['p'])}; "
+                                 f"partial eta² = {t['partial eta²']:.3f}")
+                lines += ["", f"Comparisons of '{hue}' within each '{x_var}' — pooled error "
+                          "from the model, Šídák-corrected for all of them:"]
+                for g, r in results.items():
+                    for c in r.comparisons:
+                        lines.append(f"  - {x_var} = {g}: [{c.a}] vs [{c.b}]: {format_p(c.p)} "
+                                     f"{stars(c.p)}; difference = {c.diff:.4g} "
+                                     f"(95% CI {c.ci[0]:.4g} to {c.ci[1]:.4g})")
+                    rows += self._comparison_rows(r, y_var, f"{x_var} = {g}")
+                tables.append(pd.DataFrame(table).assign(Metric=y_var))
+                texts.append("\n".join(lines) + out_txt)
+            elif hue:
                 results = StatisticsEngine.compare_within(
-                    df, x_var, hue, y_var, test, self.get_reference(),
-                    self.get_pairing_col())
+                    data, x_var, hue, y_var, test, self.get_reference(),
+                    self.get_pairing_col(), self.hue_order)
                 for g, r in results.items():
                     texts.append(StatisticsEngine.format_report(r, hue, y_var, within=f"{x_var} = {g}"))
                     rows += self._comparison_rows(r, y_var, f"{x_var} = {g}")
-                if len(results) > 1:
-                    texts.append("Note: p-values are also Holm-corrected across the "
-                                 f"{len(results)} '{x_var}' groups.")
+                note = (f"Note: p-values are also Holm-corrected across the {len(results)} "
+                        f"'{x_var}' groups." if len(results) > 1 else "")
+                texts.append(note + out_txt)
             else:
-                r = StatisticsEngine.compare(df, x_var, y_var, test, self.get_reference(),
+                r = StatisticsEngine.compare(data, x_var, y_var, test, self.get_reference(),
                                              self.get_pairing_col(), group_order=order)
-                texts.append(StatisticsEngine.format_report(r, x_var, y_var))
+                texts.append(StatisticsEngine.format_report(r, x_var, y_var) + out_txt)
                 rows += self._comparison_rows(r, y_var)
         self.current_comparisons = pd.DataFrame(rows)
-        self.stats_output.setPlainText(("\n\n" + "-" * 60 + "\n\n").join(texts))
+        self.current_anova_tables = pd.concat(tables) if tables else None
+        self.stats_output.setPlainText(("\n\n" + "-" * 60 + "\n\n").join(t for t in texts if t))
+
+    @staticmethod
+    def _outlier_text(df, flags, x_var, y_var, hue, excluded):
+        if not flags.any():
+            return "\n\nOutliers (Grubbs, alpha = 0.05): none."
+        lines = ["", "", f"Outliers (Grubbs, alpha = 0.05) — "
+                 + ("LEFT OUT of the test and plot:" if excluded else
+                    "flagged only (tick 'Leave out outliers' to exclude):")]
+        for i in flags[flags].index:
+            grp = str(df.at[i, x_var]) + (f" / {df.at[i, hue]}" if hue else "")
+            lines.append(f"  - {grp}: {df.at[i, y_var]:.6g} (row {i + 1})")
+        return "\n".join(lines)
 
     @staticmethod
     def _comparison_rows(r, y_var, within=None):
@@ -1813,7 +1888,8 @@ class BioStatExplorer(QMainWindow):
         if path:
             ExportEngine.save_excel_summary_to(
                 path, self.current_summary_df, self.stats_output.toPlainText(),
-                getattr(self, "current_comparisons", None))
+                getattr(self, "current_comparisons", None),
+                getattr(self, "current_anova_tables", None))
             self.status_bar.showMessage(f"Statistics saved: {path}", 6000)
 
     def export_pdf_report(self):

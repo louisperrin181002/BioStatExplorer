@@ -230,6 +230,49 @@ def test_behaviour():
           "numeric group labels work (reference given as a number)")
 
 
+# --------------------------------------------------------------------------
+# two-way ANOVA and outliers
+# --------------------------------------------------------------------------
+def test_two_way():
+    rng = np.random.default_rng(9)
+    rows = []
+    for a in ["WT", "LP107", "LP109"]:
+        for b in ["LB", "M9"]:
+            n = rng.integers(3, 7)                       # unbalanced
+            eff = {"WT": 0, "LP107": 1, "LP109": 2}[a] + (0.8 if b == "M9" else 0) \
+                + (1.2 if (a, b) == ("LP109", "M9") else 0)
+            rows += [{"strain": a, "medium": b, "v": eff + rng.normal(0, 0.7)} for _ in range(n)]
+    df = pd.DataFrame(rows)
+    table, res = SE.two_way(df, "strain", "medium", "v")
+    if pg is not None:
+        ref = pg.anova(data=df, dv="v", between=["strain", "medium"], ss_type=2)
+        ok = all(close(t["p"], ref["p_unc"][i], 1e-6) for i, t in enumerate(table[:3]))
+        check(ok, "two-way ANOVA (type II) = pingouin")
+    # simple effect by hand: MSE from the full model, Šídák over 3 tests
+    from statsmodels.formula.api import ols
+    m = ols("v ~ C(strain) * C(medium)", data=df).fit()
+    mse, dfr = m.mse_resid, m.df_resid
+    sub = df[df.strain == "LP109"]
+    a, b = sub[sub.medium == "LB"].v, sub[sub.medium == "M9"].v
+    t = (a.mean() - b.mean()) / np.sqrt(mse * (1 / len(a) + 1 / len(b)))
+    p = 2 * st.t.sf(abs(t), dfr)
+    c = res["LP109"].comparisons[0]
+    check(close(c.p_raw, p) and close(c.p, 1 - (1 - p) ** 3),
+          "two-way post-hoc: pooled error, Šídák-corrected")
+    check(SE.compare(df, "strain", "v", SE.TWO_WAY).error is not None,
+          "two-way without a second factor explains what is missing")
+
+
+def test_grubbs():
+    # NIST/SEMATECH handbook example: 245.57 is an outlier (G = 2.4687)
+    v = [199.31, 199.53, 200.19, 200.82, 201.92, 201.95, 202.18, 245.57]
+    check(SE.grubbs(v) == [7], "Grubbs flags the NIST example outlier")
+    check(SE.grubbs(v[:-1]) == [], "no outlier left after removing it")
+    df = pd.DataFrame({"g": ["A"] * 8 + ["B"] * 5, "v": v + [1, 1.1, 0.9, 1.05, 0.95]})
+    flag = SE.find_outliers(df, "g", "v")
+    check(list(flag[flag].index) == [7], "outliers found per group")
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

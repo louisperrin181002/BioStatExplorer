@@ -109,6 +109,7 @@ class Result:
     assumptions: list = field(default_factory=list)
     notes: list = field(default_factory=list)
     error: str | None = None
+    table: list = field(default_factory=list)    # two-way ANOVA table
 
 
 # ---------------------------------------------------------------------------
@@ -126,10 +127,11 @@ class StatisticsEngine:
     KRUSKAL_DUNN = "Kruskal-Wallis + Dunn's"
     PAIRED_T = "Paired t-test / RM-ANOVA"
     WILCOXON = "Wilcoxon / Friedman (paired)"
+    TWO_WAY = "Two-way ANOVA (X × Color by)"
     NONE = "None"
 
     ALL_TESTS = [AUTO, STUDENTS_T, WELCH_T, MANN_WHITNEY, ANOVA_TUKEY,
-                 WELCH_ANOVA, KRUSKAL_DUNN, PAIRED_T, WILCOXON, NONE]
+                 WELCH_ANOVA, KRUSKAL_DUNN, PAIRED_T, WILCOXON, TWO_WAY, NONE]
     PAIRED = (PAIRED_T, WILCOXON)
     TWO_GROUP = (STUDENTS_T, WELCH_T, MANN_WHITNEY)
     # names used by older versions of the app
@@ -177,6 +179,10 @@ class StatisticsEngine:
         if test in SE.PAIRED:
             return SE._paired(d, x_col, y_col, names, test, reference,
                               pairing_col, res)
+        if test == SE.TWO_WAY:
+            res.error = ("Two-way ANOVA needs a second factor: choose a "
+                         "'Color by' column.")
+            return res
 
         groups = {g: d.loc[d[x_col] == g, y_col].to_numpy(float)
                   for g in names}
@@ -238,7 +244,11 @@ class StatisticsEngine:
                        pairing_col=None, hue_order=None) -> dict:
         """Grouped plots: compare the *hue_col* levels inside each *x_col*
         group. Returns {x group: Result}; every comparison's p is then
-        Holm-corrected across all x groups together."""
+        Holm-corrected across all x groups together. With TWO_WAY the
+        comparisons come from the two-way model (Šídák)."""
+        if test == StatisticsEngine.TWO_WAY:
+            return StatisticsEngine.two_way(df, x_col, hue_col, y_col,
+                                            hue_order)[1]
         out = {}
         for g in dict.fromkeys(df[x_col].dropna().astype(str)):
             sub = df[df[x_col].astype(str) == g]
@@ -674,3 +684,124 @@ class StatisticsEngine:
         res.notes.append(f"{n} matched sets" + (f" (by '{pairing_col}')"
                                                  if pairing_col else ""))
         return res
+
+    # ------------------------------------------------------------------
+    # Two-way ANOVA
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def two_way(df, a_col, b_col, y_col, b_order=None):
+        """Two-way ANOVA with interaction (type II sums of squares), then
+        the *b_col* levels compared within each *a_col* level using the
+        model's pooled error, Šídák-corrected over all those comparisons
+        (as Prism's "compare within each row").
+        Returns (table: list of dicts, {a level: Result})."""
+        from statsmodels.formula.api import ols
+        import statsmodels.api as sm
+        d = df[[a_col, b_col, y_col]].copy()
+        d.columns = ["_a", "_b", "_y"]
+        d["_y"] = pd.to_numeric(d["_y"], errors="coerce")
+        d = d.dropna()
+        d["_a"] = d["_a"].astype(str)
+        d["_b"] = d["_b"].astype(str)
+        out = {}
+        if d["_a"].nunique() < 2 or d["_b"].nunique() < 2:
+            r = Result(error="Two-way ANOVA needs at least 2 levels of each factor.")
+            return [], {"(all)": r}
+        model = ols("_y ~ C(_a) * C(_b)", data=d).fit()
+        tab = sm.stats.anova_lm(model, typ=2)
+        ss_res = float(tab.loc["Residual", "sum_sq"])
+        df_res = float(tab.loc["Residual", "df"])
+        mse = ss_res / df_res
+        names = {"C(_a)": a_col, "C(_b)": b_col, "C(_a):C(_b)": f"{a_col} × {b_col}"}
+        table = []
+        for key, label in names.items():
+            ss = float(tab.loc[key, "sum_sq"])
+            table.append({"Effect": label, "df": float(tab.loc[key, "df"]),
+                          "F": float(tab.loc[key, "F"]), "p": float(tab.loc[key, "PR(>F)"]),
+                          "partial eta²": ss / (ss + ss_res)})
+        table.append({"Effect": "Residual", "df": df_res, "F": np.nan, "p": np.nan,
+                      "partial eta²": np.nan})
+        omnibus = "; ".join(f"{t['Effect']}: F({t['df']:g}, {df_res:g}) = {t['F']:.3f}, "
+                            f"{format_p(t['p'])}" for t in table[:3])
+        levels_b = list(dict.fromkeys(d["_b"]))
+        if b_order:
+            first = [str(b) for b in b_order if str(b) in levels_b]
+            levels_b = first + [b for b in levels_b if b not in first]
+        comps = []
+        for a in dict.fromkeys(d["_a"]):
+            sub = d[d["_a"] == a]
+            r = Result(test="Two-way ANOVA", omnibus=omnibus,
+                       posthoc=f"Šídák (within each {a_col})")
+            r.groups = [b for b in levels_b if (sub["_b"] == b).any()]
+            r.ns = {b: int((sub["_b"] == b).sum()) for b in r.groups}
+            for i in range(len(r.groups)):
+                for j in range(i + 1, len(r.groups)):
+                    va = sub.loc[sub["_b"] == r.groups[i], "_y"].to_numpy(float)
+                    vb = sub.loc[sub["_b"] == r.groups[j], "_y"].to_numpy(float)
+                    diff = va.mean() - vb.mean()
+                    se = np.sqrt(mse * (1 / len(va) + 1 / len(vb)))
+                    t = diff / se if se > 0 else np.inf
+                    p = float(2 * stats.t.sf(abs(t), df_res))
+                    tcrit = stats.t.ppf(1 - ALPHA / 2, df_res)
+                    c = Comparison(r.groups[i], r.groups[j], p, p_raw=p, diff=float(diff),
+                                   ci=(float(diff - tcrit * se), float(diff + tcrit * se)),
+                                   n_a=len(va), n_b=len(vb), within=a)
+                    r.comparisons.append(c)
+                    comps.append(c)
+            out[a] = r
+        m = len(comps)
+        for c in comps:                      # Šídák over all comparisons
+            c.p = float(1 - (1 - c.p_raw) ** m) if m > 1 else c.p_raw
+        for r in out.values():
+            r.table = table
+        return table, out
+
+    # ------------------------------------------------------------------
+    # Outliers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def grubbs(values, alpha=0.05):
+        """Indices of outliers by the iterative two-sided Grubbs test
+        (one at a time while n >= 3)."""
+        v = np.asarray(values, float)
+        idx = list(range(len(v)))
+        out = []
+        while len(idx) >= 3:
+            x = v[idx]
+            sd = x.std(ddof=1)
+            if sd == 0:
+                break
+            dev = np.abs(x - x.mean())
+            k = int(np.argmax(dev))
+            n = len(x)
+            g = dev[k] / sd
+            t = stats.t.ppf(1 - alpha / (2 * n), n - 2)
+            gcrit = (n - 1) / np.sqrt(n) * np.sqrt(t ** 2 / (n - 2 + t ** 2))
+            if g <= gcrit:
+                break
+            out.append(idx.pop(k))
+        return out
+
+    @staticmethod
+    def find_outliers(df, x_col, y_col, hue_col=None, alpha=0.05):
+        """Boolean Series (df's index): Grubbs outliers within each group
+        (x group, and Color-by level when given)."""
+        flag = pd.Series(False, index=df.index)
+        if df is None or df.empty or y_col not in df or x_col not in df:
+            return flag
+        y = pd.to_numeric(df[y_col], errors="coerce")
+        keys = [df[x_col].astype(str)] + ([df[hue_col].astype(str)]
+                                          if hue_col and hue_col in df else [])
+        for _, grp in y.groupby(keys):
+            grp = grp.dropna()
+            for i in StatisticsEngine.grubbs(grp.to_numpy(), alpha):
+                flag[grp.index[i]] = True
+        return flag
+
+    @staticmethod
+    def drop_outliers(df, x_col, y_col, hue_col=None, alpha=0.05):
+        if df is None or df.empty:
+            return df
+        return df[~StatisticsEngine.find_outliers(df, x_col, y_col, hue_col, alpha)]

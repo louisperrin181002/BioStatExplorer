@@ -49,12 +49,14 @@ class ExportEngine:
 
     @staticmethod
     def save_excel_summary_to(path, summary_df, stat_report_text,
-                              comparisons_df=None):
+                              comparisons_df=None, anova_df=None):
         """Excel workbook: group summary, every comparison as a table, and
         the full text report."""
         with pd.ExcelWriter(path, engine="openpyxl") as writer:
             summary_df.to_excel(writer, sheet_name="Summary Statistics",
                                 index=False)
+            if anova_df is not None and not anova_df.empty:
+                anova_df.to_excel(writer, sheet_name="Two-way ANOVA", index=False)
             if comparisons_df is not None and not comparisons_df.empty:
                 comparisons_df.to_excel(writer, sheet_name="Comparisons",
                                         index=False)
