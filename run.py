@@ -1431,10 +1431,32 @@ class BioStatExplorer(QMainWindow):
         self.metadata_col_list.clear()
         self.metadata_col_list.addItems(self.metadata_cols)
         self.rebuild_data_selection_panel()      # before plotting with it
+        if not append:
+            self._one_population_at_a_time()
         self.update_selectors(choose_defaults=not append)
         if hasattr(self, "curves_tab"):
             self.curves_tab.refresh_columns()
-        self.status_bar.showMessage(f"Loaded {combined.shape[0]} rows, {combined.shape[1]} columns.", 4000)
+        note = getattr(self, "_load_note", "")
+        self._load_note = ""
+        self.status_bar.showMessage(note or f"Loaded {combined.shape[0]} rows, "
+                                    f"{combined.shape[1]} columns.", 12000 if note else 4000)
+
+    def _one_population_at_a_time(self):
+        """FlowPy statistics in long form (one row per sample × population):
+        show one population at a time, so plots and tests don't mix them."""
+        df = self.master_df
+        lst = self.metadata_checklists.get("Population")
+        if lst is None or "Sample" not in df.columns or df["Population"].nunique() < 2:
+            return
+        pops = [lst.item(i).text() for i in range(lst.count())]
+        keep = next((p_ for p_ in reversed(pops) if p_ != "All Events"), pops[-1])
+        lst.blockSignals(True)
+        for i in range(lst.count()):
+            lst.item(i).setCheckState(Qt.CheckState.Checked if pops[i] == keep
+                                      else Qt.CheckState.Unchecked)
+        lst.blockSignals(False)
+        self._load_note = (f"FlowPy statistics: showing the population '{keep}' — choose "
+                           "another under Show only › Population")
 
     # ---------------------------------------------------------------
     # Selector population
@@ -1444,6 +1466,8 @@ class BioStatExplorer(QMainWindow):
         ID (well, file, replicate)."""
         df = self.master_df
         skip = {"Well", "Row", "Column", "Source File"}
+        if "Population" in df.columns and "Sample" in df.columns:
+            skip |= {"Sample", "Population"}     # FlowPy statistics: Sample is an ID
         best = None
         for c in self.metadata_cols:
             if c in skip:
@@ -2541,6 +2565,15 @@ def selftest():
     checks["dunnett"] = len(SE.compare(df, "g", "v", SE.ANOVA_TUKEY, reference="A").comparisons) == 2
     checks["dunn"] = len(SE.compare(df, "g", "v", SE.KRUSKAL_DUNN).comparisons) == 3
     checks["rm_anova"] = SE.compare(df, "g", "v", SE.PAIRED_T, pairing_col="rep").omnibus_p is not None
+    two = df.assign(m=["LB", "M9"] * 6)
+    checks["two_way"] = len(SE.two_way(two, "g", "m", "v")[0]) == 4
+    checks["outliers"] = SE.grubbs([1, 1.1, 0.9, 1.05, 9]) == [4]
+    from src import curves, project as proj
+    t_ = np.arange(0, 20.0)
+    checks["curves"] = abs(curves.fit_growth(t_, curves.logistic(t_, 1, 0.02, 0.5))[0]
+                           ["r (growth rate, /h)"] - 0.5) < 1e-3
+    back = proj.frame_from_json(proj.frame_to_json(df))
+    checks["project"] = back.equals(df)
     grid = pd.DataFrame([[None, 1, 2, 3, 4], ["A", 1, 2, 3, 4], ["B", 5, 6, 7, 8]])
     checks["plate"] = len(pr.find_plate_blocks(grid)) == 1
     fig, ax = plt.subplots()

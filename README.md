@@ -27,6 +27,52 @@ Build the Mac app: `pyinstaller --noconfirm BioStatExplorer.spec`
   (strain / medium per well: type, paste from Excel or import it), then
   **Build Dataset From Plate**.
 
+## Projects and undo
+
+**File → Save Project** (⌘S) keeps everything in one `.bse` file: the data,
+every graph setting (colours, order, labels, filters, test), the plate
+grids and plate series, the curve settings and the figure layout. **Open
+Project** (⇧⌘O) brings it back exactly. **Edit → Undo / Redo** (⌘Z / ⇧⌘Z)
+for data changes, colours, order, labels and layout. Closing with unsaved
+changes asks to save.
+
+## Plates: corrections and series
+
+* **Corrections** (Plate tab): subtract blanks — the wells labelled
+  `blank` (or any label, several separated by commas) in a plate-map
+  layer, optionally matched by medium so each well gets its own medium's
+  blank — and divide every readout by OD. Raw values are kept as
+  `… (raw)`; blank wells are dropped.
+* **Plate series**: select several export files in Import Plate (e.g. 8 h,
+  16 h, 24 h). The time is read from the file names (`16h`, `30 min`,
+  `3 days`; editable), one plate map applies to all, and the dataset gets
+  `Plate` and `Time (h)` columns. Import the OD files of the same time
+  points afterwards: they are added to the same plates. Corrections are
+  applied plate by plate.
+
+## Curves
+
+The **Curves** tab fits, per well or per group: a logistic growth curve
+(K, growth rate r, doubling time, lag time, time of fastest growth), the
+model-free maximum growth rate (steepest slope of ln OD), or a dose-response
+curve (4PL: EC50 with 95% CI, Hill slope, bottom, top). **Compare Parameters
+on the Plotting Dashboard** turns the table into the dataset, e.g. growth
+rate by strain with statistics (Undo returns to the data).
+
+## Figure layout
+
+**＋ Add to Layout** (above the graph) puts the current graph on the
+**Layout** page: journal width (85 / 120 / 174 / 190 mm), columns, panel
+height, one font size, panel letters. Each panel keeps its own data, so
+graphs from different datasets share a page. Export PDF / SVG / PNG / TIFF.
+
+## FlowPy statistics
+
+Open a FlowPy *Export Data* table (CSV or Excel) like any other file: one
+row per sample with columns such as `Lymph / CD3+ | CD3 FITC-A Median`; X
+defaults to your Group column. Long tables (one row per sample ×
+population) show one population at a time (*Show only › Population*).
+
 ## Statistics
 
 Both the **Statistical Analysis** report and the stars on plots come from
@@ -40,6 +86,7 @@ the same engine (`src/statistics_engine.py`), so they always agree.
 | > 2 groups, not normal | Kruskal-Wallis | Dunn's, Bonferroni over the comparisons made |
 | paired, 2 groups | paired t, Wilcoxon signed-rank | — |
 | paired, > 2 groups | repeated-measures ANOVA, Friedman | paired tests, Holm-corrected |
+| two factors (X × Color by) | two-way ANOVA (type II), partial eta² | within each X group, pooled error, Šídák |
 
 A two-group test chosen for more than two groups runs on each pair,
 Holm-corrected. With a **Group / Color By** column, colours are compared
@@ -49,6 +96,10 @@ with its 95% CI (where the test gives one) and an effect size (Cohen's d
 and Hedges' g, rank-biserial r, Cohen's dz; eta² / epsilon² for omnibus
 tests). Stars: ns p ≥ 0.05, * < 0.05, ** < 0.01, *** < 0.001,
 **** < 0.0001; all tests two-sided.
+
+**Outliers**: Grubbs' test (alpha 0.05) within each group; flagged values
+are listed in the report, and *Leave out outliers* excludes them from the
+test and the plot.
 
 **Auto** checks normality (Shapiro-Wilk, per group, n ≥ 3) and equal
 variances (Brown-Forsythe, n ≥ 3) and picks the test from the table. With
