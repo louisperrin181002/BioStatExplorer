@@ -39,6 +39,8 @@ def frame_from_json(d):
                                                     or t.startswith("float") else t)
             elif t == "bool":
                 df[c] = df[c].astype(bool)
+            elif t in ("str", "string") and int(pd.__version__.split(".")[0]) >= 3:
+                df[c] = df[c].astype(t)         # pandas 3 text columns
             else:
                 df[c] = df[c].astype(object)
         except (ValueError, TypeError):
