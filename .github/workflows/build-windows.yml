@@ -2,9 +2,13 @@ name: Build Windows executable
 
 on:
   push:
-    branches: [main]
+    branches: [main, upgrade-review]
     tags: ["v*"]
   workflow_dispatch: {}
+
+# Needed to publish the release below
+permissions:
+  contents: write
 
 jobs:
   build-windows:
@@ -22,14 +26,40 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.txt pyinstaller pillow
 
+      # Built from the .spec, not from a bare --onefile command. The spec
+      # carries the hiddenimports that figure export needs: matplotlib picks
+      # its writer from the file extension at save time, so a build without
+      # them looks fine until someone asks for an SVG.
       - name: Build with PyInstaller
-        run: |
-          pyinstaller --noconfirm --onefile --windowed --name BioStatExplorer run.py
+        run: pyinstaller --noconfirm BioStatExplorer.spec
 
-      - name: Upload the .exe as a build artifact
-        uses: actions/upload-artifact@v4
+      # A release rather than a build artifact: artifacts count against a
+      # 500 MB account-wide storage quota and expire, while a release asset
+      # is neither, and gives a permanent link that can be sent to someone
+      # without a GitHub account. The Mac build is added to the same release
+      # by hand, so this step must not clear existing assets.
+      - name: Publish the .exe as a release
+        uses: softprops/action-gh-release@v2
         with:
-          name: BioStatExplorer-windows
-          path: dist/BioStatExplorer.exe
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'BioStatExplorer — latest build' }}
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          body: |
+            BioStatExplorer — statistics and figures for lab data. Windows build
+            from `${{ github.sha }}`.
+
+            **Windows:** download `BioStatExplorer.exe` and double-click it —
+            nothing to install. SmartScreen will warn that the publisher is
+            unknown: choose **More info → Run anyway**.
+
+            **Mac (Apple Silicon):** download `BioStatExplorer-mac.zip`, unzip,
+            drag **BioStatExplorer.app** to Applications, then **right-click it →
+            Open → Open** the first time. Double-clicking gives "the developer
+            cannot be verified" with no way forward.
+
+            Both warnings appear because the app is not signed by a registered
+            Apple or Microsoft developer.
+          files: dist/BioStatExplorer.exe
+          fail_on_unmatched_files: true
