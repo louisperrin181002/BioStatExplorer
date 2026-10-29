@@ -52,12 +52,24 @@ changes asks to save.
 
 ## Curves
 
-The **Curves** tab fits, per well or per group: a logistic growth curve
-(K, growth rate r, doubling time, lag time, time of fastest growth), the
-model-free maximum growth rate (steepest slope of ln OD), or a dose-response
-curve (4PL: EC50 with 95% CI, Hill slope, bottom, top). **Compare Parameters
-on the Plotting Dashboard** turns the table into the dataset, e.g. growth
-rate by strain with statistics (Undo returns to the data).
+Curve fitting lives on the **Plotting Dashboard** — chart type *Growth
+curve (mean ± error)* — rather than in a tab of its own, so a fitted
+curve is built with the same controls as any other figure. It fits, per
+well or per group: a logistic growth curve (K, growth rate r, doubling
+time, lag time, time of fastest growth), the model-free maximum growth
+rate (steepest slope of ln OD), or a dose-response curve (4PL: EC50 with
+95% CI, Hill slope, bottom, top). **Compare Parameters on the Plotting
+Dashboard** turns the table into the dataset, e.g. growth rate by strain
+with statistics (Undo returns to the data).
+
+How the error is drawn is set in the Style tab: **Error bars**
+(SD / SEM / 95% CI), **Shown as** (band, bars or mean only), **Error
+around** (the fitted curve or the mean — the band is clamped to enclose
+whichever is chosen) and **Draw the error as smooth curves**, which
+draws the band on the fitted curve's own grid so its edges follow the
+curve instead of cutting between timepoints. Only the drawing changes:
+the error is always the replicate spread, interpolated between
+timepoints with a monotone cubic that cannot overshoot.
 
 ## Figure layout
 
