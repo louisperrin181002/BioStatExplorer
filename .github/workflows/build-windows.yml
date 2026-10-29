@@ -45,7 +45,11 @@ jobs:
         with:
           tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest' }}
           name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'BioStatExplorer — latest build' }}
-          prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          # Not a prerelease: GitHub's "Latest release" link and badge
+          # skip prereleases, so marking it one 404s the very URL that
+          # gets sent to someone who just wants the download.
+          prerelease: false
+          make_latest: "true"
           body: |
             BioStatExplorer — statistics and figures for lab data. Windows build
             from `${{ github.sha }}`.
