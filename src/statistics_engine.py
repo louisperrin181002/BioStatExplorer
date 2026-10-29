@@ -19,6 +19,7 @@ Checked against scipy, statsmodels, pingouin and scikit-posthocs
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -202,6 +203,24 @@ class StatisticsEngine:
         normal, equal_var = SE._assumptions(groups, res)
         k = len(names)
         if test == SE.AUTO:
+            n_min = min(len(v) for v in groups.values())
+            floor = SE.rank_test_p_floor(k, n_min)
+            if not normal and floor > ALPHA:
+                # The checks asked for a rank test that cannot return a
+                # significant result at this n, whatever the data show —
+                # choosing it is choosing "not significant" in advance.
+                # Shapiro-Wilk has almost no power at this n either, so
+                # the evidence against normality is weak. Use the Welch
+                # form: valid under unequal variance and usable at small n.
+                res.notes.append(
+                    f"The assumption checks pointed to a rank test, but with "
+                    f"{n_min} value(s) per group the smallest p it could "
+                    f"return for two neighbouring groups is "
+                    f"{format_p(floor)} — it cannot reach {ALPHA} however "
+                    f"far apart the groups are. Auto used the Welch form "
+                    f"instead (robust to unequal variance, and it works at "
+                    f"this n). Choose the rank test by hand if you want it.")
+                normal, equal_var = True, False
             if k == 2:
                 test = (SE.MANN_WHITNEY if not normal else
                         SE.STUDENTS_T if equal_var else SE.WELCH_T)
@@ -212,10 +231,10 @@ class StatisticsEngine:
                 f"Auto chose {test} from the checks above. These checks "
                 "have little power with few replicates — if you know your "
                 "data's distribution, choose the test yourself.")
-            if test == SE.MANN_WHITNEY and min(len(v) for v in
-                                               groups.values()) < 4:
-                res.notes.append("With fewer than 4 values per group a "
-                                 "rank test cannot reach p < 0.05.")
+            if test in (SE.MANN_WHITNEY, SE.KRUSKAL_DUNN) and floor > ALPHA:
+                res.notes.append(
+                    f"With {n_min} value(s) per group this rank test cannot "
+                    f"reach p < {ALPHA} (best possible: {format_p(floor)}).")
 
         if test in SE.TWO_GROUP:
             pairs = SE._pairs(names, reference)
@@ -325,6 +344,30 @@ class StatisticsEngine:
     # ------------------------------------------------------------------
     # Assumptions
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def rank_test_p_floor(k: int, n_min: int) -> float:
+        """The smallest p a rank test could return for two *neighbouring*
+        groups, if those groups separated perfectly.
+
+        A rank test only sees orderings, so with few replicates there are
+        not enough distinct orderings to be surprising. Dunn's on three
+        groups of four bottoms out at p = 0.35: no effect size, however
+        large, can beat it. Auto uses this to avoid picking a test that
+        has already decided the answer.
+
+        Two groups: the exact Mann-Whitney tail. More: Dunn's normal
+        approximation at perfect separation (neighbouring groups differ by
+        n_min in mean rank), times the number of comparisons.
+        """
+        if k < 2 or n_min < 1:
+            return 1.0
+        if k == 2:
+            return min(1.0, 2.0 / math.comb(2 * n_min, n_min))
+        N = k * n_min
+        se = math.sqrt(N * (N + 1) / 12.0 * (2.0 / n_min))
+        p = 2 * stats.norm.sf(n_min / se)
+        return float(min(1.0, p * k * (k - 1) / 2))
 
     @staticmethod
     def _assumptions(groups: dict, res: Result) -> tuple[bool, bool]:

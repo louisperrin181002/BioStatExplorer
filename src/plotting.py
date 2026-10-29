@@ -21,6 +21,10 @@ PALETTES = {
              "#80CBC4", "#F6D186", "#A3A9B5", "#F4A6C6", "#9ED2E6"],
     "Bold": ["#1D4ED8", "#C2410C", "#047857", "#B91C1C", "#6D28D9",
              "#0369A1", "#A16207", "#334155", "#BE185D", "#0F766E"],
+    # for print, and for model-vs-measured plots where the bars should
+    # read as one series seen three ways rather than three categories
+    "Greyscale": ["#1A1A1A", "#8C8C8C", "#DCDCDC", "#5A5A5A", "#B4B4B4",
+                  "#2E2E2E", "#A0A0A0", "#6E6E6E"],
 }
 PALETTE_NAMES = list(PALETTES) + ["muted", "deep", "pastel", "rocket", "crest"]
 
@@ -38,6 +42,505 @@ def palette_colors(name, n):
 
 
 class PlottingEngine:
+    #: Chart types that compare predictions with measurements. They take
+    #: the Metric as the measurement and *predicted_cols* as the models,
+    #: so they bypass the usual group-and-test machinery entirely.
+    MODEL_CHARTS = ("Model vs Measured", "Model vs Measured (bars)")
+
+    #: Mean of the replicates at each X with error bars, drawn the way
+    #: growth curves appear in papers: open markers, thin bars, one series
+    #: per condition on shared axes, optionally with a fitted curve.
+    GROWTH_CHART = "Growth curve (mean ± error)"
+
+    #: What the error bars may show. SD describes the spread of the
+    #: replicates; SEM and CI describe how well the mean is pinned down.
+    #: Papers usually print SD for growth curves and say so in the legend.
+    ERROR_BARS = ("SD", "SEM", "95% CI")
+
+    #: How the error is drawn. A time course read every few minutes has so
+    #: many points that capped bars merge into a smear, so a shaded band
+    #: around the mean is the readable form — and the one growth curves are
+    #: usually published with. MEAN_ONLY draws no error at all, for a clean
+    #: figure where the spread is reported elsewhere.
+    MEAN_ONLY = "Mean only (no error)"
+    ERROR_STYLES = ("Band (continuous)", "Bars", MEAN_ONLY)
+
+    #: What the error is drawn around. Centred on the fitted curve the
+    #: figure reads as one smooth curve with the spread wrapped round it;
+    #: centred on the mean it stays with the data, wander and all. Only the
+    #: centre line moves — the error is the replicates' spread either way,
+    #: and the band is clamped to enclose whichever is chosen.
+    CENTRE_FIT = "Fitted curve"
+    CENTRE_MEAN = "Mean curve"
+    ERROR_CENTRES = (CENTRE_FIT, CENTRE_MEAN)
+
+    #: Comparing whole curves means reducing each replicate series to one
+    #: number first — you cannot test "the curves differ" without saying in
+    #: what respect. Each of these answers a different question: the area
+    #: covers the whole time course, the maximum is the yield, the rate is
+    #: the speed, and the last value is the endpoint.
+    CURVE_MEASURES = ("Area under the curve", "Maximum value",
+                      "Fitted rate / EC50", "Value at the last X")
+    NO_CURVE_STAT = "None"
+
+    #: The one parameter worth putting in the legend, per model, tried in
+    #: order. Everything else stays in the parameter table.
+    _HEADLINE = (("r (growth rate, /h)", "r = {:.2f}/h"),
+                 ("µmax (/h)", "µmax = {:.2f}/h"),
+                 ("EC50", "EC50 = {:.3g}"))
+
+    @staticmethod
+    def _headline(params):
+        r2 = params.get("R²")
+        tail = f", R² = {r2:.3f}" if r2 is not None and np.isfinite(r2) else ""
+        for key, fmt in PlottingEngine._HEADLINE:
+            v = params.get(key)
+            if v is not None and np.isfinite(v):
+                return fmt.format(v) + tail
+        return tail.lstrip(", ") or "fitted"
+
+    @staticmethod
+    def curve_summaries(df, x_col, y_col, hue_col, rep_col, measure,
+                        model=None):
+        """One number per replicate series, ready for a group comparison.
+
+        Returns a frame with the condition in *hue_col* (or "All") and the
+        measure in a column named after it. A series needs at least three
+        points; shorter ones are dropped rather than guessed at.
+        """
+        cols = [c for c in (x_col, y_col, hue_col, rep_col) if c]
+        d = df[list(dict.fromkeys(cols))].copy()
+        for c in (x_col, y_col):
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+        d = d.dropna(subset=[x_col, y_col])
+        if d.empty or not rep_col:
+            return pd.DataFrame()
+        keys = [c for c in (hue_col, rep_col) if c]
+        rows = []
+        for key, g in d.groupby(keys, sort=False):
+            key = key if isinstance(key, tuple) else (key,)
+            g = g.sort_values(x_col)
+            xs = g[x_col].to_numpy(float)
+            ys = g[y_col].to_numpy(float)
+            if len(xs) < 3:
+                continue
+            if measure == "Area under the curve":
+                val = float(np.trapezoid(ys, xs)) if hasattr(np, "trapezoid") \
+                    else float(np.trapz(ys, xs))
+            elif measure == "Maximum value":
+                val = float(np.nanmax(ys))
+            elif measure == "Value at the last X":
+                val = float(ys[-1])
+            else:
+                try:
+                    from src import curves as _curves
+                except ImportError:                      # pragma: no cover
+                    continue
+                fitter = _curves.FITTERS.get(model or _curves.GROWTH,
+                                             _curves.fit_growth)
+                params, fn = fitter(xs, ys)
+                val = next((params[k] for k, _ in PlottingEngine._HEADLINE
+                            if np.isfinite(params.get(k, np.nan))), np.nan)
+                if fn is None or not np.isfinite(val):
+                    continue
+            rows.append({(hue_col or "Condition"): (str(key[0]) if hue_col
+                                                    else "All"),
+                         measure: val})
+        return pd.DataFrame(rows)
+
+    @staticmethod
+    def _curve_stat_box(ax, df, x_col, y_col, hue_col, rep_col, measure,
+                        stat_mode, reference, text_color, max_lines=6,
+                        model=None):
+        """Compare the conditions on *measure* and print the result on the
+        plot. Brackets make no sense over a time axis, so the comparison is
+        stated instead of drawn."""
+        from src.statistics_engine import StatisticsEngine as SE, format_p
+        summ = PlottingEngine.curve_summaries(df, x_col, y_col, hue_col,
+                                              rep_col, measure, model)
+        gcol = hue_col or "Condition"
+        if summ.empty or summ[gcol].nunique() < 2:
+            msg = ("Pick a replicate column to compare curves"
+                   if summ.empty else
+                   "Only one condition — nothing to compare")
+            ax.text(0.015, 0.985, msg, transform=ax.transAxes, ha="left",
+                    va="top", fontsize=7.5, color=text_color, alpha=0.85)
+            return
+        order = list(dict.fromkeys(summ[gcol]))
+        res = SE.compare(summ, gcol, measure, stat_mode, reference, None,
+                         group_order=order)
+        n = summ.groupby(gcol)[measure].count()
+        head = f"{measure} — {res.test or stat_mode}  (n = " + \
+            (f"{n.min()}" if n.min() == n.max() else f"{n.min()}–{n.max()}") + ")"
+        lines = [head]
+        for c in res.comparisons[:max_lines]:
+            star = "✱" if c.significant else "ns"
+            lines.append(f"   {c.a} vs {c.b}:  {format_p(c.p)}  {star}")
+        extra = len(res.comparisons) - max_lines
+        if extra > 0:
+            lines.append(f"   +{extra} more — see the Statistics tab")
+        ax.text(0.015, 0.985, "\n".join(lines), transform=ax.transAxes,
+                ha="left", va="top", fontsize=7.4, color=text_color,
+                linespacing=1.45,
+                bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
+                          edgecolor="#CBD5E1", linewidth=0.7, alpha=0.9))
+
+    @staticmethod
+    def _spread(values, kind):
+        """Half-length of the error bar for one set of replicates."""
+        v = np.asarray(values, float)
+        v = v[np.isfinite(v)]
+        n = v.size
+        if n < 2:
+            return 0.0
+        if kind == "SD":
+            return float(v.std(ddof=1))
+        sem = float(stats.sem(v))
+        if kind == "95% CI":
+            return float(sem * stats.t.ppf(0.975, n - 1))
+        return sem
+
+    @staticmethod
+    def _band(means, errs, smooth=True):
+        """The lower and upper edges of the error band.
+
+        Smoothing a noisy series can pull an edge past the mean it is
+        supposed to enclose, which reads as an error — so the edges are
+        pushed back out over the mean and re-smoothed a few times, each
+        pass with a shorter window, and clamped once at the end. The result
+        is a smooth envelope that always contains the mean line, with a
+        gentle bulge where a timepoint strays rather than a hard kink.
+        """
+        means = np.asarray(means, float)
+        errs = np.asarray(errs, float)
+        if not smooth:
+            return means - errs, means + errs
+        lo = PlottingEngine._smooth(means - errs)
+        hi = PlottingEngine._smooth(means + errs)
+        for _ in range(3):
+            lo = PlottingEngine._smooth(np.minimum(lo, means), frac=0.05)
+            hi = PlottingEngine._smooth(np.maximum(hi, means), frac=0.05)
+        return np.minimum(lo, means), np.maximum(hi, means)
+
+    @staticmethod
+    def _interp(xs, ys, grid):
+        """*ys* resampled onto *grid* as a smooth, shape-preserving curve.
+
+        Monotone cubic (PCHIP) rather than a plain cubic spline: it passes
+        through every point without the overshoot that would invent an
+        error larger than any replicate ever showed, or a negative one.
+        """
+        xs, ys = np.asarray(xs, float), np.asarray(ys, float)
+        ok = np.isfinite(xs) & np.isfinite(ys)
+        if ok.sum() < 2:
+            return np.full(np.size(grid), ys[ok][0] if ok.any() else np.nan)
+        try:
+            from scipy.interpolate import PchipInterpolator
+            return PchipInterpolator(xs[ok], ys[ok])(grid)
+        except Exception:                            # pragma: no cover
+            return np.interp(grid, xs[ok], ys[ok])
+
+    @staticmethod
+    def _dense_band(xs, means, errs, grid, fn=None):
+        """Band edges along *grid* instead of along the timepoints.
+
+        A moving average cannot smooth four points, so on a plate read with
+        only a handful of timepoints the ribbon stayed a chain of straight
+        segments while the fitted curve beside it was drawn on 300 — the
+        band looked nothing like the mean it belonged to. Resampling the
+        spread onto the curve's own grid fixes that at the source: the
+        error is still exactly the replicate spread at each timepoint, and
+        between them it varies as smoothly as the curve does.
+
+        Centred on the fit (*fn*), ``centre ± error`` encloses it already.
+        Centred on the mean, the drawn mean line is still straight, so the
+        edges are clamped to it — the band can bulge away from that line
+        but never cross it.
+        """
+        errs_d = np.clip(PlottingEngine._interp(xs, errs, grid), 0.0, None)
+        centre_d = (np.asarray(fn(grid), float) if fn is not None
+                    else PlottingEngine._interp(xs, means, grid))
+        lo, hi = centre_d - errs_d, centre_d + errs_d
+        if fn is None:
+            line = np.interp(grid, xs, means)
+            lo, hi = np.minimum(lo, line), np.maximum(hi, line)
+        return lo, hi
+
+    @staticmethod
+    def _smooth(y, frac=0.12):
+        """A short centred moving average, for drawing only.
+
+        Used on the edges of the error band so a plate read every few
+        minutes gives a smooth ribbon instead of a frayed one. The window
+        shrinks at the two ends rather than padding, so the curve starts
+        and finishes on the real values instead of being dragged flat.
+        Deliberately a local average and not the fitted model: the band
+        has to stay on the mean curve even where the model does not.
+        """
+        y = np.asarray(y, float)
+        n = y.size
+        win = int(max(3, round(n * frac)))
+        if n < 5 or win < 3:
+            return y
+        win += 1 - win % 2                       # odd, so it stays centred
+        half = win // 2
+        out = np.empty(n, float)
+        for i in range(n):
+            lo, hi = max(0, i - half), min(n, i + half + 1)
+            seg = y[lo:hi]
+            seg = seg[np.isfinite(seg)]
+            out[i] = seg.mean() if seg.size else y[i]
+        return out
+
+    @staticmethod
+    def _draw_growth(df, x_col, y_col, ax, hue_col, palette, text_color,
+                     grid_color, bw_mode=False, hue_levels=None,
+                     error_bars="SD", fit=True, log_scale=False,
+                     error_style="Band (continuous)", stat_box=False,
+                     model=None, log_x=False, smooth_error=True,
+                     error_centre=None):
+        """Mean ± error at each X, one series per condition.
+
+        *fit* overlays one logistic per condition, fitted to the mean curve
+        — the same model and the same axes for every condition, so the
+        curves can be read against each other rather than each on its own
+        terms.
+
+        *smooth_error* draws the band as a pair of smooth curves around the
+        mean curve, instead of a ribbon that frays at every timepoint. It
+        changes nothing about the error itself, which is always the spread
+        of the replicates at that X — only how its envelope is drawn.
+        """
+        cols = [x_col, y_col] + ([hue_col] if hue_col else [])
+        d = df[cols].copy()
+        for c in (x_col, y_col):
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+        d = d.dropna(subset=[x_col, y_col])
+        if d.empty:
+            ax.text(0.5, 0.5, f"'{x_col}' and '{y_col}' must both be "
+                    "numeric — a growth curve needs a time axis",
+                    ha="center", va="center", transform=ax.transAxes,
+                    color=text_color, fontsize=10, wrap=True)
+            return
+
+        levels = (hue_levels or list(d[hue_col].dropna().unique())) \
+            if hue_col else [y_col]
+        colors = (palette if len(palette) >= len(levels)
+                  else sns.color_palette("muted", n_colors=max(len(levels), 1)))
+        markers = ["o", "s", "^", "D", "v", "P"]
+
+        # The fit follows whichever model is chosen, so one chart covers
+        # growth curves and dose-response alike.
+        try:
+            from src import curves as _curves
+            fitter = _curves.FITTERS.get(model or _curves.GROWTH)
+        except ImportError:                              # pragma: no cover
+            _curves, fitter = None, None
+
+        handles, n_seen = [], set()
+        for i, lev in enumerate(levels):
+            sub = d[d[hue_col] == lev] if hue_col else d
+            g = sub.groupby(x_col)[y_col]
+            xs = np.asarray(sorted(g.groups), float)
+            means = g.mean().reindex(xs).to_numpy(float)
+            errs = np.array([PlottingEngine._spread(g.get_group(x), error_bars)
+                             for x in xs])
+            n_seen.update(g.count().unique().tolist())
+            colour = colors[i % len(colors)]
+            marker = markers[i % len(markers)] if bw_mode else "o"
+
+            fitted = None
+            if fit and fitter is not None and len(xs) >= 4:
+                params, fn = fitter(xs, means)
+                # Not every model reports R² — the max-slope fit has none —
+                # so a usable fitting function is what counts.
+                if fn is not None:
+                    fitted = (params, fn)
+
+            # What the error is drawn around. On the fitted curve it reads
+            # as one smooth curve with the replicate spread wrapped round
+            # it; on the mean it stays with the data, wander and all. The
+            # error is the same either way — only its centre line moves —
+            # and whichever is chosen, the band is clamped to enclose it.
+            centre = means
+            on_fit = False
+            if fitted and error_centre in (None, PlottingEngine.CENTRE_FIT):
+                modelled = np.asarray(fitted[1](xs), dtype=float)
+                if modelled.shape == means.shape and np.all(
+                        np.isfinite(modelled)):
+                    centre, on_fit = modelled, True
+
+            # The grid the fitted curve is drawn on, and now the band too,
+            # so the two are the same shape rather than one curve beside a
+            # chain of segments.
+            grid = (np.logspace(np.log10(xs[xs > 0].min()),
+                                np.log10(xs.max()), 300)
+                    if log_x and np.any(xs > 0)
+                    else np.linspace(xs.min(), xs.max(), 300))
+
+            def edges():
+                """Lower and upper edge of the error, and their X."""
+                if not smooth_error:
+                    lo, hi = PlottingEngine._band(centre, errs, False)
+                    return xs, lo, hi
+                lo, hi = PlottingEngine._dense_band(
+                    xs, means, errs, grid,
+                    fn=fitted[1] if on_fit else None)
+                return grid, lo, hi
+
+            if error_style == "Bars":
+                # Open markers with capped bars. A thin line joins them
+                # only when there is no fit to carry the eye instead.
+                handle = ax.errorbar(
+                    xs, centre, yerr=errs, fmt=marker, markersize=4.5,
+                    markerfacecolor="none", markeredgecolor=colour,
+                    markeredgewidth=1.1, ecolor=colour, elinewidth=0.9,
+                    capsize=2.0, capthick=0.9,
+                    linestyle="none" if fitted else "-",
+                    color=colour, linewidth=1.0, zorder=3)
+                if smooth_error:
+                    # The caps alone show the spread one timepoint at a
+                    # time; these two curves trace where it is going, which
+                    # is what you want when the bars are dense enough to
+                    # read as a smear.
+                    ex, lo, hi = edges()
+                    for edge in (lo, hi):
+                        ax.plot(ex, edge, color=colour, linewidth=0.9,
+                                alpha=0.8, zorder=2)
+            else:
+                # Continuous band: the mean as a line, the error as a
+                # shaded ribbon around it. Clipped at zero on a log axis,
+                # where mean − SD can fall below the scale. With MEAN_ONLY
+                # the ribbon is left out and the mean line carries the
+                # figure on its own, so it is drawn at full weight unless a
+                # fitted curve is there to lead the eye instead.
+                if error_style != PlottingEngine.MEAN_ONLY:
+                    # The band's edges are mean ± error at every timepoint,
+                    # so on a noisy plate read they jitter as much as the
+                    # data does and the ribbon looks frayed. Smoothing runs
+                    # a short centred average along both the mean and the
+                    # spread, which rounds the edges into curves while
+                    # keeping the band on the mean curve — it is the drawn
+                    # envelope that is smoothed, never the data or the
+                    # statistics.
+                    ex, lo, hi = edges()
+                    if log_scale:
+                        lo = np.clip(lo, np.nanmin(means[means > 0]) / 10.0
+                                     if np.any(means > 0) else 1e-9, None)
+                    ax.fill_between(ex, lo, hi, color=colour, alpha=0.22,
+                                    linewidth=0, zorder=2)
+                    # Outline the ribbon. A fill alone has no definite edge,
+                    # so where several conditions overlap you cannot tell
+                    # whose band you are looking at; the drawn edge is also
+                    # what makes the published form of this figure legible
+                    # in print, where a 22% tint nearly disappears.
+                    for edge in (lo, hi):
+                        ax.plot(ex, edge, color=colour, linewidth=0.8,
+                                alpha=0.9, zorder=2)
+                mean_only = error_style == PlottingEngine.MEAN_ONLY
+                handle, = ax.plot(
+                    xs, means, color=colour,
+                    linewidth=1.8 if (mean_only and not fitted) else 0.9,
+                    zorder=3,
+                    linestyle="--" if fitted else "-",
+                    alpha=0.75 if fitted else 1.0,
+                    marker=marker if bw_mode else "None", markersize=3.5,
+                    markerfacecolor="none", markevery=max(1, len(xs) // 12))
+            if fitted:
+                params, fn = fitted
+                ax.plot(grid, fn(grid), color=colour, linewidth=1.8,
+                        zorder=4)
+                label = f"{lev}  ({PlottingEngine._headline(params)})"
+            else:
+                label = str(lev)
+            handles.append((handle, label))
+
+        if log_scale:
+            ax.set_yscale("log")
+        else:
+            ax.set_ylim(bottom=0)
+        if log_x:
+            ax.set_xscale("log")
+        else:
+            ax.set_xlim(left=float(d[x_col].min()))
+        ax.set_xlabel(x_col)
+        ax.set_ylabel(y_col)
+        ax.yaxis.grid(True, linestyle="-", linewidth=0.8, color=grid_color)
+        ax.xaxis.grid(False)
+        ax.set_axisbelow(True)
+
+        reps = f"n = {min(n_seen)}" if len(n_seen) == 1 else \
+            f"n = {min(n_seen)}–{max(n_seen)}"
+        # Name the curve the error is wrapped around, so the figure cannot
+        # be read as spread about the mean when it is spread about the fit.
+        on_fit = (fit and fitter is not None
+                  and error_centre in (None, PlottingEngine.CENTRE_FIT))
+        centred = "fit" if on_fit else "mean"
+        if error_style == PlottingEngine.MEAN_ONLY:
+            note = f"mean of replicates, {reps}"
+        elif error_style == "Bars":
+            note = (f"{centred} ± {error_bars} (smoothed), {reps}"
+                    if smooth_error else f"{centred} ± {error_bars}, {reps}")
+        else:
+            # Say when the envelope has been smoothed, so nobody reads the
+            # ribbon's edge as the error at that exact timepoint.
+            note = (f"{centred} ± {error_bars} (smoothed band), {reps}"
+                    if smooth_error
+                    else f"{centred} ± {error_bars} (shaded), {reps}")
+        # Under the axes, where a figure caption belongs: a growth curve
+        # fills every corner at some point, and inside the axes this note
+        # ended up printing through the legend. Both the window (via
+        # tight_layout) and every export (via bbox_inches="tight") grow to
+        # include it, so it is never clipped.
+        ax.text(1.0, -0.22, note, transform=ax.transAxes, ha="right",
+                va="top", fontsize=7.5, color=text_color, alpha=0.8)
+        # "best" rather than a fixed corner: a growth curve fills whichever
+        # corner you pick, and the fit labels make the legend wide.
+        legend = ax.legend([h for h, _ in handles], [t for _, t in handles],
+                           title=hue_col if hue_col else None, fontsize=8.5,
+                           title_fontsize=9, frameon=False,
+                           loc="lower right" if stat_box else "best")
+        if legend:
+            for text_obj, (_, lbl) in zip(legend.get_texts(), handles):
+                text_obj.set_picker(True)
+                text_obj.set_url("group_color:" + lbl.split("  (")[0])
+
+    @staticmethod
+    def _draw_model_check(ax, df, label_col, measured_col, predicted_cols,
+                          plot_type, pc, palette, log_scale, custom_title,
+                          text_color):
+        """Measured against one or more model columns."""
+        from src import model_check
+        cols = [c for c in predicted_cols if c and c != measured_col]
+        if not cols:
+            ax.text(0.5, 0.5, "Choose a Predicted column\n"
+                    "(the Metric is the measured value)", ha="center",
+                    va="center", transform=ax.transAxes, color=text_color)
+            ax.axis("off")
+            return
+        table, dropped = model_check.prepare(df, label_col, measured_col,
+                                             cols)
+        if table.empty:
+            ax.text(0.5, 0.5, "Nothing to compare — a log comparison needs\n"
+                    "positive values in both columns.", ha="center",
+                    va="center", transform=ax.transAxes, color=text_color)
+            ax.axis("off")
+            return
+        colors = palette_colors(palette, len(cols) + 1)[1:]
+        if plot_type == "Model vs Measured (bars)":
+            model_check.draw_bars(ax, table, measured_col, cols, colors,
+                                  pc=pc, label_col=label_col,
+                                  log=log_scale or True,
+                                  measured_color=pc.get("line", "#334155"))
+        else:
+            model_check.draw_scatter(ax, table, measured_col, cols, colors,
+                                     pc=pc, label_col=label_col,
+                                     log=log_scale or True)
+        title = custom_title or f"{measured_col} — measured against model"
+        if dropped:
+            title += f"  ({dropped} row(s) dropped)"
+        ax.set_title(title, color=text_color, fontsize=11)
+
     @staticmethod
     def generate_plot(df, plot_type, x_col, y_col, ax, dark_mode=False, palette="Modern",
                        stat_mode="Auto (Prism Mode)", hue_col=None, log_scale=False,
@@ -45,7 +548,12 @@ class PlottingEngine:
                        y_min=None, y_max=None, group_colors=None, bw_mode=False,
                        hist_bins=20, custom_title=None, custom_xlabel=None,
                        custom_ylabel=None, group_order=None, show_ns=False,
-                       hue_order=None):
+                       hue_order=None, predicted_cols=None,
+                       error_bars="SD", fit_curve=True,
+                       error_style="Band (continuous)",
+                       curve_measure="None", replicate_col=None,
+                       curve_model=None, log_x=False, smooth_error=True,
+                       error_centre=None):
         """Generates plots while respecting active application theme states and overlays stars."""
         ax.clear()
 
@@ -64,6 +572,13 @@ class PlottingEngine:
 
         if df is None or df.empty or not x_col or not y_col:
             ax.text(0.5, 0.5, "Select X and Y variables to plot", ha='center', va='center', transform=ax.transAxes, color=text_color)
+            return
+
+        if plot_type in PlottingEngine.MODEL_CHARTS:
+            PlottingEngine._draw_model_check(
+                ax, df, x_col, y_col, predicted_cols or [], plot_type, pc,
+                palette, log_scale, custom_title, text_color)
+            PlottingEngine._style_spines(ax, text_color)
             return
         if x_col == y_col:
             ax.text(0.5, 0.5, f"'{x_col}' is both the X axis and the Metric —\n"
@@ -108,7 +623,7 @@ class PlottingEngine:
                 first.sort(key=lambda h: [str(o) for o in hue_order].index(str(h)))
                 color_categories = first + [h for h in color_categories
                                             if h not in first]
-        elif plot_type == "Line":
+        elif plot_type in ("Line", PlottingEngine.GROWTH_CHART):
             # A single line (no Group/Color-By column) has no natural set of
             # "categories" to click-recolor - key it off y_col itself so the
             # curve is still individually addressable/recolorable.
@@ -128,6 +643,34 @@ class PlottingEngine:
         resolved_palette = [group_colors.get(str(cat), default_colors[i]) if not bw_mode
                              else default_colors[i]
                              for i, cat in enumerate(color_categories)]
+
+        if plot_type == PlottingEngine.GROWTH_CHART:
+            PlottingEngine._draw_growth(
+                df, x_col, y_col, ax, hue_col, resolved_palette, text_color,
+                grid_color, bw_mode=bw_mode,
+                hue_levels=color_categories if hue_col else None,
+                error_bars=error_bars, fit=fit_curve, log_scale=log_scale,
+                model=curve_model, log_x=log_x, smooth_error=smooth_error,
+                error_centre=error_centre,
+                error_style=error_style, stat_box=(
+                    stat_mode != "None" and curve_measure not in (
+                        None, PlottingEngine.NO_CURVE_STAT)))
+            if stat_mode != "None" and curve_measure not in (
+                    None, PlottingEngine.NO_CURVE_STAT):
+                PlottingEngine._curve_stat_box(
+                    ax, df, x_col, y_col, hue_col, replicate_col,
+                    curve_measure, stat_mode, reference, text_color,
+                    model=curve_model)
+            ax.set_title(custom_title or f"{y_col} over {x_col}",
+                         color=text_color, fontsize=11)
+            if custom_xlabel:
+                ax.set_xlabel(custom_xlabel)
+            if custom_ylabel:
+                ax.set_ylabel(custom_ylabel)
+            if y_min is not None or y_max is not None:
+                ax.set_ylim(bottom=y_min, top=y_max)
+            PlottingEngine._style_spines(ax, text_color)
+            return
 
         # --- Special plot types: these don't share the categorical group /
         # significance-overlay / xtick-rotation pipeline below, so they draw
@@ -156,6 +699,7 @@ class PlottingEngine:
                                      hue_levels=color_categories if hue_col else None)
         elif plot_type == "Line":
             PlottingEngine._draw_line(df, x_col, y_col, ax, hue_col, resolved_palette, text_color, bw_mode,
+                                      error_bars=error_bars,
                                       hue_levels=color_categories if hue_col else None)
         elif plot_type == "Boxplot":
             sns.boxplot(data=df, x=x_col, y=y_col, hue=hue_col if hue_col else x_col, ax=ax,
@@ -198,8 +742,22 @@ class PlottingEngine:
 
         # --- STATISTICAL OVERLAY CORE (categorical charts only — a continuous
         # line plot compares curves, not discrete groups, so it's skipped) ---
-        if (not is_line and len(unique_groups) >= 2 and plot_type in
-                ["Boxplot", "Violin", "Beeswarm", "Box + Swarm", "Bar"] and stat_mode != "None"):
+        stat_on = stat_mode != "None"
+        can_stat = (not is_line and len(unique_groups) >= 2
+                    and plot_type in PlottingEngine.STAT_CHARTS)
+        if stat_on and not can_stat:
+            # The commonest reason the overlay "does nothing": the chart
+            # type has no brackets, or there is only one group to compare.
+            if len(unique_groups) < 2:
+                PlottingEngine._stat_note(
+                    ax, "Only one group on the X axis — nothing to compare",
+                    line_color)
+            elif plot_type not in PlottingEngine.STAT_CHARTS:
+                PlottingEngine._stat_note(
+                    ax, f"No significance brackets on a {plot_type} graph — "
+                        f"use {', '.join(PlottingEngine.STAT_CHARTS[:-1])} "
+                        f"or {PlottingEngine.STAT_CHARTS[-1]}", line_color)
+        if stat_on and can_stat:
             bar_tops = None
             if plot_type == "Bar":
                 # brackets must clear the error bars, not just the points
@@ -210,13 +768,30 @@ class PlottingEngine:
                 if hue_col:
                     tops = tops.groupby(level=0).max()
                 bar_tops = {str(k): float(v) for k, v in tops.items()}
-            PlottingEngine.annotate_significance(
+            drawn = PlottingEngine.annotate_significance(
                 df, x_col, y_col, unique_groups, ax, stat_mode, line_color,
                 reference=reference, pairing_col=pairing_col,
                 log_scale=log_scale, show_pvalue=show_pvalue,
                 hue_col=hue_col, hue_order=[str(h) for h in hue_order],
                 dodge_width=PlottingEngine.DODGE_WIDTH.get(plot_type, 0.8),
                 show_ns=show_ns, bar_tops=bar_tops)
+            if not drawn:
+                # Distinguish "the test ran and found nothing" from "there
+                # was never enough data to test" — they look identical on
+                # the plot otherwise, and only one of them is a result.
+                counts = pd.to_numeric(df[y_col], errors="coerce").groupby(
+                    df[x_col].astype(str)).count()
+                if (counts >= 2).sum() < 2:
+                    PlottingEngine._stat_note(
+                        ax, "Not enough replicates to test — a comparison "
+                            "needs at least 2 values in each of 2 groups",
+                        line_color)
+                else:
+                    PlottingEngine._stat_note(
+                        ax, "No significant differences"
+                            + ("" if show_ns else " — tick 'Show "
+                               "non-significant (ns)' to see every bracket"),
+                        line_color)
 
         numeric_x = plot_type == "Scatter" and pd.api.types.is_numeric_dtype(df[x_col])
         if not is_line and not numeric_x:
@@ -348,9 +923,10 @@ class PlottingEngine:
             ax.axhline(0, color=text_color, linewidth=0.8, zorder=1)
 
     @staticmethod
-    def _draw_line(df, x_col, y_col, ax, hue_col, palette, text_color, bw_mode=False, hue_levels=None):
+    def _draw_line(df, x_col, y_col, ax, hue_col, palette, text_color, bw_mode=False, hue_levels=None,
+                   error_bars="SEM"):
         """
-        Connected mean +/- SEM line plot for continuous X data (e.g. a time
+        Connected mean +/- error line plot for continuous X data (e.g. a time
         course or substrate-concentration curve in an enzyme kinetics assay).
         One line per hue level if a Group/Color-By column is set.
         """
@@ -378,7 +954,8 @@ class PlottingEngine:
             sub = df_clean[df_clean[hue_col] == h_level] if hue_col else df_clean
             grouped = sub.groupby(x_col)[y_col]
             means = grouped.mean()
-            sems = grouped.apply(lambda v: stats.sem(v) if len(v) > 1 else 0.0)
+            sems = grouped.apply(
+                lambda v: PlottingEngine._spread(v, error_bars))
             order = means.index.argsort()
             xs = means.index.values[order]
             ys = means.values[order]
@@ -792,6 +1369,17 @@ class PlottingEngine:
     DODGE_WIDTH = {"Bar": 0.8, "Boxplot": 0.5, "Violin": 0.8,
                    "Beeswarm": 0.8, "Box + Swarm": 0.8}
     MAX_BRACKETS = 15
+    #: The chart types significance brackets can be drawn on. The rest are
+    #: either not group comparisons (Line, Scatter, Heatmap, Volcano…) or
+    #: draw themselves whole (Stacked Bar, the model checks).
+    STAT_CHARTS = ["Boxplot", "Violin", "Beeswarm", "Box + Swarm", "Bar"]
+
+    @staticmethod
+    def _stat_note(ax, text, line_color):
+        """Say why no brackets were drawn, instead of leaving the plot
+        looking as though the test never ran."""
+        ax.text(0.99, 0.99, text, transform=ax.transAxes, ha="right",
+                va="top", fontsize=7.5, color=line_color, alpha=0.85)
 
     @staticmethod
     def _artist_tops(ax, n_groups) -> dict:

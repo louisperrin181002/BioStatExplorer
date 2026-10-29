@@ -21,7 +21,7 @@ from matplotlib.figure import Figure
 from src.excel_loader import DataLoader, sheet_names, read_grid
 from src.plotting import PlottingEngine, PALETTE_NAMES, palette_colors
 from src.groups_panel import GroupsPanel
-from src.curves_tab import CurvesTab
+from src import curves
 from src.layout_tab import LayoutTab
 from src.filters import FilterEngine
 from src.normalization import NormalizationEngine, plate_normalise
@@ -536,13 +536,30 @@ class BioStatExplorer(QMainWindow):
         data_scroll, f = form_page()
         self.chart_selector = combo(self.update_plot)
         self.chart_selector.addItems(["Bar", "Box + Swarm", "Boxplot", "Violin", "Beeswarm",
-                                      "Scatter", "Line", "Stacked Bar", "Stacked Histogram",
-                                      "Heatmap", "Volcano Plot", "Dendrogram", "Network Graph"])
+                                      "Scatter", "Line", PlottingEngine.GROWTH_CHART,
+                                      "Stacked Bar", "Stacked Histogram",
+                                      "Heatmap", "Volcano Plot", "Dendrogram", "Network Graph",
+                                      "Model vs Measured",
+                                      "Model vs Measured (bars)"])
         f.addRow("Graph", self.chart_selector)
         self.x_selector = combo(self.on_x_axis_changed)
         f.addRow("X axis", self.x_selector)
         self.y_selector = combo(self.update_plot)
         f.addRow("Metric", self.y_selector)
+        # Only for the model-vs-measured charts: the Metric is then the
+        # measurement, and these are the model columns compared with it.
+        self.predicted_selector = combo(self.update_plot)
+        self.predicted_selector.setToolTip(
+            "The model's prediction. The Metric above is the measurement "
+            "it is compared with.")
+        self._predicted_label = QLabel("Predicted")
+        f.addRow(self._predicted_label, self.predicted_selector)
+        self.predicted2_selector = combo(self.update_plot)
+        self.predicted2_selector.setToolTip(
+            "Optional second model, to compare two of them against the "
+            "same measurement.")
+        self._predicted2_label = QLabel("Compare with")
+        f.addRow(self._predicted2_label, self.predicted2_selector)
         self.hue_selector = combo(self.update_plot)
         self.hue_selector.setToolTip("Splits each X group into coloured bars/boxes")
         f.addRow("Color by", self.hue_selector)
@@ -593,6 +610,64 @@ class BioStatExplorer(QMainWindow):
         self.hist_bins_spin.valueChanged.connect(self.update_plot)
         self._bins_label = QLabel("Bins")
         f.addRow(self._bins_label, self.hist_bins_spin)
+        # Growth / Line charts: what the error bars mean, and whether a
+        # curve is fitted through the means.
+        self.error_bars_selector = combo(self.update_plot)
+        self.error_bars_selector.addItems(PlottingEngine.ERROR_BARS)
+        self.error_bars_selector.setToolTip(
+            "SD is the spread of the replicates; SEM and the 95% CI say how "
+            "well the mean is pinned down. Growth curves in papers usually "
+            "show SD.")
+        self._error_bars_label = QLabel("Error bars")
+        f.addRow(self._error_bars_label, self.error_bars_selector)
+        self.error_style_selector = combo(self.update_plot)
+        self.error_style_selector.addItems(PlottingEngine.ERROR_STYLES)
+        self.error_style_selector.setToolTip(
+            "A band is a shaded ribbon around the mean — the readable form "
+            "when a plate reader gives you a point every few minutes. Bars "
+            "are the capped kind, better for a handful of timepoints. "
+            "Mean only draws the lines alone, for a clean figure where the "
+            "spread is reported in the text or a table.")
+        self._error_style_label = QLabel("Shown as")
+        f.addRow(self._error_style_label, self.error_style_selector)
+        self.curve_model_selector = combo(self.update_plot)
+        self.curve_model_selector.addItems(curves.MODELS)
+        self.curve_model_selector.setToolTip(
+            "Logistic for a growth curve, max slope of ln(OD) for a "
+            "model-free growth rate, 4PL for a dose-response.")
+        self._curve_model_label = QLabel("Curve model")
+        f.addRow(self._curve_model_label, self.curve_model_selector)
+        self.log_x_cb = check("Log X axis (dose-response)")
+        self.fit_curve_cb = check("Fit a logistic curve through the means")
+        self.fit_curve_cb.setChecked(True)
+        self.fit_curve_cb.setToolTip(
+            "One logistic per condition, same model and same axes for all of "
+            "them, so the conditions can be read against each other. The "
+            "growth rate and R² go in the legend.")
+        f.addRow("", self.fit_curve_cb)
+        self.fit_curve_cb.toggled.connect(self._sync_control_visibility)
+        self.error_centre_selector = combo(self.update_plot)
+        self.error_centre_selector.addItems(PlottingEngine.ERROR_CENTRES)
+        self.error_centre_selector.setToolTip(
+            "Which curve the error wraps around. The fitted curve gives one "
+            "smooth logistic with the replicate spread enclosing it; the "
+            "mean curve keeps the error on the data itself. The error is "
+            "the same spread either way — only its centre moves — and it "
+            "always encloses whichever curve you pick.")
+        self._error_centre_label = QLabel("Error around")
+        f.addRow(self._error_centre_label, self.error_centre_selector)
+        self.smooth_error_cb = check("Draw the error as smooth curves")
+        self.smooth_error_cb.setChecked(True)
+        self.smooth_error_cb.setToolTip(
+            "Two smooth curves tracing the error around the mean curve. "
+            "With Band they are the ribbon's edges, so it stops fraying at "
+            "every timepoint; with Bars they are drawn through the caps, "
+            "which shows where the spread is going when the bars are dense "
+            "enough to read as a smear. The error itself is unchanged — "
+            "still the spread of your replicates at each X — and the "
+            "caption says when it has been smoothed.")
+        f.addRow("", self.smooth_error_cb)
+        f.addRow("", self.log_x_cb)
         section(f, "Labels")
         lab_hint = QLabel("Click the title or an axis label on the graph to edit it.")
         lab_hint.setObjectName("Hint")
@@ -630,6 +705,29 @@ class BioStatExplorer(QMainWindow):
         self.stat_mode_selector = combo(self.update_plot)
         self.stat_mode_selector.addItems(StatisticsEngine.ALL_TESTS)
         f.addRow("Test", self.stat_mode_selector)
+        self.curve_measure_selector = combo(self.update_plot)
+        self.curve_measure_selector.addItems(
+            [PlottingEngine.NO_CURVE_STAT] + list(PlottingEngine.CURVE_MEASURES))
+        self.curve_measure_selector.setToolTip(
+            "Reduce each replicate curve to one number, then compare the "
+            "conditions on it. Area covers the whole time course, Maximum "
+            "is the yield, Growth rate is the speed.")
+        self._curve_measure_label = QLabel("Compare curves by")
+        f.addRow(self._curve_measure_label, self.curve_measure_selector)
+        self.replicate_selector = combo(self.update_plot)
+        self.replicate_selector.setToolTip(
+            "The column that tells one replicate curve from another — "
+            "usually Well or Replicate")
+        self._replicate_label = QLabel("Replicate")
+        f.addRow(self._replicate_label, self.replicate_selector)
+        self.curve_fit_btn = QPushButton("Fit every replicate → parameter table")
+        self.curve_fit_btn.setToolTip(
+            "Fits one curve per replicate and makes the parameters (growth "
+            "rate, K, lag, doubling time, R²) the dataset, so they can be "
+            "plotted and tested like any other measurement. Undo (⌘Z) "
+            "brings your data back.")
+        self.curve_fit_btn.clicked.connect(self.fit_curves_to_table)
+        f.addRow("", self.curve_fit_btn)
         self.reference_selector = combo(self.update_plot)
         self.reference_selector.setToolTip("Compare every group with this one only "
                                            "(Dunnett / Dunn vs control)")
@@ -660,7 +758,9 @@ class BioStatExplorer(QMainWindow):
         f.addRow(run_btn)
         self.control_tabs.addTab(stats_scroll, "Stats")
 
-        for w in (self.chart_selector, self.stat_mode_selector):
+        for w in (self.chart_selector, self.stat_mode_selector,
+                  self.curve_measure_selector, self.error_style_selector,
+                  self.error_centre_selector):
             w.currentTextChanged.connect(self._sync_control_visibility)
 
         # Graph + Groups panel
@@ -756,11 +856,6 @@ class BioStatExplorer(QMainWindow):
         self.tabs.addTab(self.plate_tab, "Plate")
         self.tabs.addTab(self.graph_tab, "Plotting Dashboard")
         self.tabs.addTab(self.analysis_tab, "Statistical Analysis")
-        self.curves_tab = CurvesTab(lambda: (self.get_active_plot_df(),
-                                             list(getattr(self, "metric_cols", []))))
-        self.curves_tab.send_parameters.connect(self._use_curve_parameters)
-        self.curves_tab.export_requested.connect(self._export_curve_parameters)
-        self.tabs.addTab(self.curves_tab, "Curves")
         self.layout_tab = LayoutTab(lambda ax, df, spec: BioStatExplorer.draw_metric(
             ax, df, spec, spec["metrics"][0]))
         self.layout_tab.export_requested.connect(self._export_layout)
@@ -1434,8 +1529,6 @@ class BioStatExplorer(QMainWindow):
         if not append:
             self._one_population_at_a_time()
         self.update_selectors(choose_defaults=not append)
-        if hasattr(self, "curves_tab"):
-            self.curves_tab.refresh_columns()
         note = getattr(self, "_load_note", "")
         self._load_note = ""
         self.status_bar.showMessage(note or f"Loaded {combined.shape[0]} rows, "
@@ -1505,9 +1598,37 @@ class BioStatExplorer(QMainWindow):
             self.y_selector.setCurrentText(old_y)
         self.x_selector.blockSignals(False)
         self.y_selector.blockSignals(False)
+        self._rebuild_predicted_selectors(metric_candidates)
         self.rebuild_hue_and_pairing_selectors()
         self.rebuild_reference_selector()
         self.update_plot()
+
+    def _rebuild_predicted_selectors(self, metric_candidates):
+        """The model columns for the model-vs-measured charts.
+
+        A guess is offered when a column name looks like a prediction, so
+        the usual case needs no setting up.
+        """
+        looks_predicted = [c for c in metric_candidates
+                           if any(w in c.lower() for w in
+                                  ("predict", "model", "expected", "calc",
+                                   "simulat", "promoter x", "fitted"))]
+        for combo_w, prefer in ((self.predicted_selector,
+                                 looks_predicted[:1]),
+                                (self.predicted2_selector,
+                                 looks_predicted[1:2])):
+            current = combo_w.currentText()
+            combo_w.blockSignals(True)
+            combo_w.clear()
+            combo_w.addItem(NO_SELECTION)
+            combo_w.addItems(metric_candidates)
+            if current in metric_candidates:
+                combo_w.setCurrentText(current)
+            elif prefer:
+                combo_w.setCurrentText(prefer[0])
+            else:
+                combo_w.setCurrentIndex(0)
+            combo_w.blockSignals(False)
 
     CHART_HELP = {
         "Heatmap": "Rows = X groups; columns = Color by (or every metric if empty).",
@@ -1518,7 +1639,25 @@ class BioStatExplorer(QMainWindow):
         "Stacked Histogram": "Distribution of the Metric, stacked by Color by "
                              "(or by X).",
         "Stacked Bar": "Sum of the Metric per X group, stacked by Color by.",
-        "Line": "Mean ± SEM against a numeric X (time, concentration…).",
+        "Line": "Mean ± error against a numeric X (time, concentration…).",
+        PlottingEngine.GROWTH_CHART:
+            "X = time, Metric = OD (or any signal), Color by = the "
+            "condition. Replicates are averaged at each timepoint and drawn "
+            "as open markers with error bars, with one logistic fitted per "
+            "condition — same model and same axes throughout, so the "
+            "conditions can be compared directly. The growth rate and R² "
+            "appear in the legend. To test the conditions against each "
+            "other, set 'Compare curves by' on the Stats tab — each "
+            "replicate curve is reduced to one number first. Click a "
+            "legend entry to recolour that condition.",
+        "Model vs Measured": "X = the construct label, Metric = what you "
+                             "measured, Predicted = what the model says. "
+                             "Each model is scaled by one constant fitted "
+                             "in log space, then plotted against the 1:1 "
+                             "line. Replicates are collapsed to a median.",
+        "Model vs Measured (bars)": "Same inputs, drawn as measured and "
+                                    "model side by side, one group per "
+                                    "construct.",
     }
 
     def _sync_control_visibility(self, *_):
@@ -1529,6 +1668,48 @@ class BioStatExplorer(QMainWindow):
         self.chart_help_label.setVisible(bool(help_text))
         for w in [self._bins_label, self.hist_bins_spin]:
             w.setVisible(chart == "Stacked Histogram")
+        curve_chart = chart in ("Line", PlottingEngine.GROWTH_CHART)
+        # With "Mean only" there is no error drawn, so a picker for what the
+        # error means would mislead rather than inform.
+        mean_only = (chart == PlottingEngine.GROWTH_CHART
+                     and self.error_style_selector.currentText()
+                     == PlottingEngine.MEAN_ONLY)
+        for w in (self._error_bars_label, self.error_bars_selector):
+            w.setVisible(curve_chart and not mean_only)
+        for w in (self._error_style_label, self.error_style_selector):
+            w.setVisible(chart == PlottingEngine.GROWTH_CHART)
+        growth = chart == PlottingEngine.GROWTH_CHART
+        for w in (self._curve_measure_label, self.curve_measure_selector):
+            w.setVisible(growth)
+        rep_on = growth and self.curve_measure_selector.currentText() != \
+            PlottingEngine.NO_CURVE_STAT
+        for w in (self._replicate_label, self.replicate_selector):
+            w.setVisible(rep_on)
+        self.curve_fit_btn.setVisible(growth)
+        self.fit_curve_cb.setVisible(chart == PlottingEngine.GROWTH_CHART)
+        # It applies to both drawn forms — it rounds the band's edges, and
+        # it adds a pair of error curves to the bars. Only "Mean only" has
+        # no error to draw, and even then it is greyed rather than hidden:
+        # a control that disappears is one the user hunts for and concludes
+        # is missing.
+        self.smooth_error_cb.setVisible(chart == PlottingEngine.GROWTH_CHART)
+        style = self.error_style_selector.currentText()
+        has_error = style != PlottingEngine.MEAN_ONLY
+        self.smooth_error_cb.setEnabled(has_error)
+        # Nothing to centre the error on until a curve is fitted.
+        for w in (self._error_centre_label, self.error_centre_selector):
+            w.setVisible(chart == PlottingEngine.GROWTH_CHART)
+            w.setEnabled(has_error and self.fit_curve_cb.isChecked())
+        self.smooth_error_cb.setText(
+            "Draw the error as smooth curves" if has_error else
+            "Draw the error as smooth curves  (no error shown)")
+        for w in (self._curve_model_label, self.curve_model_selector,
+                  self.log_x_cb):
+            w.setVisible(chart == PlottingEngine.GROWTH_CHART)
+        model_chart = chart in PlottingEngine.MODEL_CHARTS
+        for w in (self._predicted_label, self.predicted_selector,
+                  self._predicted2_label, self.predicted2_selector):
+            w.setVisible(model_chart)
         for w in [self._break_section, self.axis_break_cb] + self._break_rows:
             w.setVisible(chart == "Line")
         paired = self.stat_mode_selector.currentText() in StatisticsEngine.PAIRED
@@ -1556,6 +1737,24 @@ class BioStatExplorer(QMainWindow):
             idx = combo.findText(current)
             combo.setCurrentIndex(idx if idx >= 0 else 0)
             combo.blockSignals(False)
+        # A replicate id may be text ("Well") or a number ("Replicate"),
+        # so offer every column, not just the metadata ones.
+        all_cols = [c for c in (list(self.master_df.columns)
+                                if self.master_df is not None else [])
+                    if c != x_col]
+        rep = self.replicate_selector
+        current = rep.currentText()
+        rep.blockSignals(True)
+        rep.clear()
+        rep.addItem(NO_SELECTION)
+        rep.addItems(all_cols)
+        if current and rep.findText(current) >= 0:
+            rep.setCurrentText(current)
+        else:
+            guess = next((c for c in all_cols
+                          if c.lower() in ("well", "replicate", "rep")), None)
+            rep.setCurrentText(guess or NO_SELECTION)
+        rep.blockSignals(False)
 
     def rebuild_reference_selector(self):
         x_col = self.x_selector.currentText()
@@ -1624,6 +1823,10 @@ class BioStatExplorer(QMainWindow):
             return [c for c in self.metric_cols if c in df_cols]
         current = self.y_selector.currentText()
         return [current] if current else []
+
+    def get_replicate_col(self):
+        rep = self.replicate_selector.currentText()
+        return None if (not rep or rep == NO_SELECTION) else rep
 
     def get_reference(self):
         ref = self.reference_selector.currentText()
@@ -1740,14 +1943,19 @@ class BioStatExplorer(QMainWindow):
         if df is None or df.empty or not x_col or x_col not in df.columns:
             self.groups_panel.set_groups([])
             return
-        x_groups = self._current_group_order()
+        # On a curve chart the X axis is a continuous measurement (time,
+        # dose), so its values are not groups: listing all 49 timepoints
+        # here filled the panel with numbers and left no way to recolour
+        # the conditions, which are the series.
+        curve_chart = chart in ("Line", PlottingEngine.GROWTH_CHART)
+        x_groups = [] if curve_chart else self._current_group_order()
         series = None
         if hue_col and hue_col in df.columns and hue_col != x_col:
             levels = [str(v) for v in df[hue_col].dropna().unique()]
             first = [h for h in self.hue_order if h in levels]
             series = first + [h for h in levels if h not in first]
             cats = series
-        elif chart == "Line":
+        elif curve_chart:
             cats = [metric]
         else:
             cats = x_groups
@@ -1760,7 +1968,7 @@ class BioStatExplorer(QMainWindow):
             colors = palette_colors(self.palette_selector.currentText(), len(cats))
         shown = {str(c): (colors[i] if bw else self.group_colors.get(str(c), colors[i]))
                  for i, c in enumerate(cats)}
-        if chart == "Line" and not series:
+        if curve_chart and not series:
             series = [metric]
         self.groups_panel.set_groups(x_groups, series, shown, self.group_colors)
 
@@ -1927,6 +2135,9 @@ class BioStatExplorer(QMainWindow):
             "x": self.x_selector.currentText(),
             "metrics": self.get_selected_metrics(),
             "y": self.y_selector.currentText(),
+            "predicted": [c for c in (self.predicted_selector.currentText(),
+                                      self.predicted2_selector.currentText())
+                          if c and c != NO_SELECTION],
             "all_metrics": self.show_all_metrics_cb.isChecked(),
             "hue": self.get_hue(),
             "reference": self.get_reference(),
@@ -1936,6 +2147,15 @@ class BioStatExplorer(QMainWindow):
             "stat": self.stat_mode_selector.currentText(),
             "bw": self.bw_mode_cb.isChecked(),
             "bins": self.hist_bins_spin.value(),
+            "error_bars": self.error_bars_selector.currentText(),
+            "error_style": self.error_style_selector.currentText(),
+            "smooth_error": self.smooth_error_cb.isChecked(),
+            "error_centre": self.error_centre_selector.currentText(),
+            "curve_measure": self.curve_measure_selector.currentText(),
+            "curve_model": self.curve_model_selector.currentText(),
+            "log_x": self.log_x_cb.isChecked(),
+            "replicate": self.get_replicate_col(),
+            "fit_curve": self.fit_curve_cb.isChecked(),
             "palette": self.palette_selector.currentText(),
             "show_p": self.show_pvalue_cb.isChecked(),
             "show_ns": self.show_ns_cb.isChecked(),
@@ -1987,7 +2207,18 @@ class BioStatExplorer(QMainWindow):
             group_colors=spec["group_colors"], bw_mode=spec["bw"], hist_bins=spec["bins"],
             custom_title=spec["titles"].get(y_col), custom_xlabel=spec.get("xlabel"),
             custom_ylabel=spec["ylabels"].get(y_col), group_order=spec["group_order"],
-            show_ns=spec["show_ns"], hue_order=spec["hue_order"])
+            show_ns=spec["show_ns"], hue_order=spec["hue_order"],
+            predicted_cols=spec.get("predicted"),
+            error_bars=spec.get("error_bars", "SD"),
+            fit_curve=spec.get("fit_curve", True),
+            smooth_error=spec.get("smooth_error", True),
+            error_centre=spec.get("error_centre"),
+            error_style=spec.get("error_style", "Band (continuous)"),
+            curve_measure=spec.get("curve_measure",
+                                   PlottingEngine.NO_CURVE_STAT),
+            replicate_col=spec.get("replicate"),
+            curve_model=spec.get("curve_model"),
+            log_x=bool(spec.get("log_x")))
         return y_col
 
     def update_plot(self):
@@ -2217,7 +2448,6 @@ class BioStatExplorer(QMainWindow):
             "dock_filters": {k: list(v) for k, v in self.dock_filter_selections.items()},
             "plate": self._plate_state(),
             "layout": self.layout_tab.to_list(for_file) if hasattr(self, "layout_tab") else [],
-            "curves": self.curves_tab.to_dict() if hasattr(self, "curves_tab") else {},
         }
 
     def apply_state(self, st):
@@ -2239,8 +2469,8 @@ class BioStatExplorer(QMainWindow):
             self._restore_plate(st.get("plate"))
             if hasattr(self, "layout_tab"):
                 self.layout_tab.from_list(st.get("layout", []))
-            if hasattr(self, "curves_tab"):
-                self.curves_tab.from_dict(st.get("curves", {}))
+            # Projects saved before the Curves tab was folded into the
+            # dashboard carry a "curves" block; it is simply ignored.
         finally:
             self._restoring = False
         self.update_plot()
@@ -2250,35 +2480,73 @@ class BioStatExplorer(QMainWindow):
             return
         widgets = [self.chart_selector, self.x_selector, self.y_selector, self.hue_selector,
                    self.reference_selector, self.pairing_selector, self.palette_selector,
-                   self.stat_mode_selector]
+                   self.stat_mode_selector, self.predicted_selector,
+                   self.predicted2_selector, self.error_bars_selector,
+                   self.error_style_selector, self.curve_measure_selector,
+                   self.replicate_selector, self.curve_model_selector,
+                   self.error_centre_selector]
         for w in widgets:
             w.blockSignals(True)
         try:
             for combo, key in ((self.chart_selector, "chart"), (self.x_selector, "x"),
                                (self.y_selector, "y"), (self.palette_selector, "palette"),
-                               (self.stat_mode_selector, "stat")):
+                               (self.stat_mode_selector, "stat"),
+                               (self.error_bars_selector, "error_bars"),
+                               (self.error_style_selector, "error_style"),
+                               (self.curve_measure_selector, "curve_measure"),
+                               (self.curve_model_selector, "curve_model")):
                 if sp.get(key) and combo.findText(sp[key]) >= 0:
                     combo.setCurrentText(sp[key])
             self.rebuild_hue_and_pairing_selectors()
             self.rebuild_reference_selector()
             for combo, key in ((self.hue_selector, "hue"), (self.reference_selector, "reference"),
-                               (self.pairing_selector, "pairing")):
+                               (self.pairing_selector, "pairing"),
+                               (self.replicate_selector, "replicate")):
                 v = sp.get(key) or NO_SELECTION
                 combo.setCurrentText(v if combo.findText(v) >= 0 else NO_SELECTION)
+            pred = list(sp.get("predicted") or [])
+            for combo, v in ((self.predicted_selector,
+                              pred[0] if pred else NO_SELECTION),
+                             (self.predicted2_selector,
+                              pred[1] if len(pred) > 1 else NO_SELECTION)):
+                combo.setCurrentText(v if combo.findText(v) >= 0
+                                     else NO_SELECTION)
         finally:
             for w in widgets:
                 w.blockSignals(False)
         checks = ((self.show_all_metrics_cb, "all_metrics"), (self.normalize_ref_cb, "normalize"),
                   (self.log_scale_cb, "log"), (self.bw_mode_cb, "bw"),
                   (self.show_pvalue_cb, "show_p"), (self.show_ns_cb, "show_ns"),
-                  (self.exclude_outliers_cb, "exclude_outliers"))
+                  (self.exclude_outliers_cb, "exclude_outliers"),
+                  (self.log_x_cb, "log_x"))
         for cb, key in checks:
             cb.blockSignals(True)
             cb.setChecked(bool(sp.get(key)))
             cb.blockSignals(False)
+        # New keys need an explicit default: the loop above only sets a
+        # combo when the key is present, so a project saved before these
+        # existed would otherwise keep whatever is on screen — and quietly
+        # switch curve statistics on.
+        self.curve_measure_selector.blockSignals(True)
+        self.curve_measure_selector.setCurrentText(
+            sp.get("curve_measure") or PlottingEngine.NO_CURVE_STAT)
+        self.curve_measure_selector.blockSignals(False)
+        # Defaults to on, so a project saved before this option existed
+        # must not come back with the fit switched off.
+        self.fit_curve_cb.blockSignals(True)
+        self.fit_curve_cb.setChecked(bool(sp.get("fit_curve", True)))
+        self.fit_curve_cb.blockSignals(False)
+        if sp.get("error_centre"):
+            self.error_centre_selector.blockSignals(True)
+            self.error_centre_selector.setCurrentText(sp["error_centre"])
+            self.error_centre_selector.blockSignals(False)
+        self.smooth_error_cb.blockSignals(True)
+        self.smooth_error_cb.setChecked(bool(sp.get("smooth_error", True)))
+        self.smooth_error_cb.blockSignals(False)
         self.hist_bins_spin.blockSignals(True)
         self.hist_bins_spin.setValue(int(sp.get("bins", 20)))
         self.hist_bins_spin.blockSignals(False)
+        self._sync_control_visibility()
         rng = sp.get("y_range")
         vals = rng or sp.get("y_range_values") or [0.0, 100.0]
         self.manual_yrange_cb.blockSignals(True)
@@ -2460,11 +2728,49 @@ class BioStatExplorer(QMainWindow):
             self.status_bar.showMessage(f"Saved {path} ({w:.0f} × {h:.0f} mm)", 8000)
 
     # --- curves ---
+    def fit_curves_to_table(self):
+        """Fit one curve per replicate and plot the parameters.
+
+        The same fit the Curves tab does, driven from the dashboard so the
+        whole curve workflow lives in one place.
+        """
+        df = self.get_active_plot_df()
+        x, y = self.x_selector.currentText(), self.y_selector.currentText()
+        hue, rep = self.get_hue(), self.get_replicate_col()
+        if df is None or df.empty or not x or not y:
+            QMessageBox.information(self, "Curves",
+                                    "Open some data and choose X and Metric "
+                                    "first.")
+            return
+        if not rep:
+            QMessageBox.information(
+                self, "Curves",
+                "Choose a Replicate column on the Stats tab — it says which "
+                "rows belong to the same curve (usually Well).")
+            return
+        keys = [c for c in (hue, rep) if c]
+        keep = [c for c in df.columns if c not in (x, y)]
+        model = self.curve_model_selector.currentText()
+        params, _ = curves.fit_groups(df, x, y, keys, model, keep=keep)
+        if params.empty:
+            QMessageBox.information(self, "Curves", "Nothing could be fitted.")
+            return
+        self.ingest_dataframe(params.drop(columns=["Note"], errors="ignore"),
+                              append=False, source_label="Curve fits")
+        if hue and hue in self.metadata_cols:
+            self.x_selector.setCurrentText(hue)
+        failed = int(params["Note"].notna().sum()) if "Note" in params else 0
+        self.status_bar.showMessage(
+            f"{len(params)} curve(s) fitted"
+            + (f", {failed} failed" if failed else "")
+            + " — now plotting the parameters. Undo (⌘Z) brings your data back",
+            10000)
+
     def _use_curve_parameters(self, params):
         if params is None or params.empty:
             QMessageBox.information(self, "Curves", "Fit some curves first.")
             return
-        group = self.curves_tab.color.currentText()
+        group = self.get_hue() or ""
         self.ingest_dataframe(params.drop(columns=["Note"], errors="ignore"),
                               append=False, source_label="Curve fits")
         if group in self.metadata_cols:

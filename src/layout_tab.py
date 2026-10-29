@@ -70,30 +70,30 @@ class LayoutTab(QWidget):
         sl.addWidget(page)
         f = QFormLayout()
         f.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        self.width = QComboBox()
-        self.width.addItems(list(WIDTHS))
-        self.width.setCurrentText("Double column (174 mm)")
-        f.addRow("Width", self.width)
+        self.width_combo = QComboBox()
+        self.width_combo.addItems(list(WIDTHS))
+        self.width_combo.setCurrentText("Double column (174 mm)")
+        f.addRow("Width", self.width_combo)
         self.cols = QSpinBox()
         self.cols.setRange(1, 6)
         self.cols.setValue(2)
         f.addRow("Columns", self.cols)
-        self.height = QDoubleSpinBox()
-        self.height.setRange(20, 250)
-        self.height.setValue(60)
-        self.height.setSuffix(" mm")
-        f.addRow("Panel height", self.height)
-        self.font = QDoubleSpinBox()
-        self.font.setRange(5, 14)
-        self.font.setValue(7)
-        self.font.setSingleStep(0.5)
-        self.font.setSuffix(" pt")
-        f.addRow("Font size", self.font)
+        self.height_spin = QDoubleSpinBox()
+        self.height_spin.setRange(20, 250)
+        self.height_spin.setValue(60)
+        self.height_spin.setSuffix(" mm")
+        f.addRow("Panel height", self.height_spin)
+        self.font_spin = QDoubleSpinBox()
+        self.font_spin.setRange(5, 14)
+        self.font_spin.setValue(7)
+        self.font_spin.setSingleStep(0.5)
+        self.font_spin.setSuffix(" pt")
+        f.addRow("Font size", self.font_spin)
         self.letters = QCheckBox("Panel letters (A, B, C…)")
         self.letters.setChecked(True)
         f.addRow("", self.letters)
         sl.addLayout(f)
-        for w in (self.width, self.cols, self.height, self.font, self.letters):
+        for w in (self.width_combo, self.cols, self.height_spin, self.font_spin, self.letters):
             sig = getattr(w, "currentTextChanged", None) or getattr(w, "valueChanged", None) \
                 or w.toggled
             sig.connect(self.render)
@@ -184,7 +184,7 @@ class LayoutTab(QWidget):
         n = max(len(self.panels), 1)
         cols = min(self.cols.value(), n)
         rows = math.ceil(n / cols)
-        return WIDTHS[self.width.currentText()], rows * self.height.value(), rows, cols
+        return WIDTHS[self.width_combo.currentText()], rows * self.height_spin.value(), rows, cols
 
     def render(self, *_, figure=None):
         fig = figure or self.figure
@@ -201,7 +201,7 @@ class LayoutTab(QWidget):
             if figure is None:
                 self.canvas.draw()
             return
-        size = self.font.value()
+        size = self.font_spin.value()
         with matplotlib.rc_context({"font.size": size}):
             for i, p in enumerate(self.panels):
                 ax = fig.add_subplot(rows, cols, i + 1)
@@ -256,8 +256,8 @@ class LayoutTab(QWidget):
     # ------------------------------------------------------------------
 
     def to_list(self, for_file=False):
-        page = {"width": self.width.currentText(), "cols": self.cols.value(),
-                "height": self.height.value(), "font": self.font.value(),
+        page = {"width": self.width_combo.currentText(), "cols": self.cols.value(),
+                "height": self.height_spin.value(), "font": self.font_spin.value(),
                 "letters": self.letters.isChecked()}
         return [{"page": page}] + [
             {"spec": p["spec"], "name": p["name"],
@@ -269,10 +269,10 @@ class LayoutTab(QWidget):
         for it in items or []:
             if "page" in it:
                 pg = it["page"]
-                for w, key, setter in ((self.width, "width", "setCurrentText"),
+                for w, key, setter in ((self.width_combo, "width", "setCurrentText"),
                                        (self.cols, "cols", "setValue"),
-                                       (self.height, "height", "setValue"),
-                                       (self.font, "font", "setValue"),
+                                       (self.height_spin, "height", "setValue"),
+                                       (self.font_spin, "font", "setValue"),
                                        (self.letters, "letters", "setChecked")):
                     if key in pg:
                         w.blockSignals(True)

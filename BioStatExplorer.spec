@@ -5,7 +5,7 @@ a = Analysis(
     ['run.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('assets/icon.png', 'assets')],
     # figure exports load these backends by name at save time
     hiddenimports=['matplotlib.backends.backend_svg',
                    'matplotlib.backends.backend_pdf',
@@ -53,7 +53,7 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='BioStatExplorer.app',
-    icon=None,
+    icon='assets/icon.icns',
     bundle_identifier='uk.ac.earlham.biostatexplorer',
     info_plist={'CFBundleShortVersionString': '2.0.0',
                 'NSHighResolutionCapable': True},
