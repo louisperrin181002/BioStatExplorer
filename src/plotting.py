@@ -41,11 +41,130 @@ def palette_colors(name, n):
         return palette_colors("Modern", n)
 
 
+
+# ---------------------------------------------------------------------------
+# The click inspector
+#
+# Any chart can record where each row of data was drawn; clicking near a
+# point then names it and prints its values. Kept as parallel arrays on the
+# axes rather than as pickable artists on purpose: seaborn builds its own
+# collections and splits them per hue level, so the artist a click lands on
+# says little about which row it is, while a position always does.
+# ---------------------------------------------------------------------------
+
+#: How close a click has to land, in screen pixels, to count as a hit.
+#: Generous enough to forgive a trackpad, tight enough that two neighbours
+#: in a dense scatter are still told apart.
+PICK_RADIUS_PX = 14.0
+
+
+def register_points(ax, xs, ys, frame, label_col=None, fields=None,
+                    x_slack=None, note=None):
+    """Remember that row *i* of *frame* was drawn at (xs[i], ys[i]).
+
+    *x_slack*, in data units, marks a chart whose x position is jittered
+    or dodged rather than meaningful — a swarm, a raincloud. The lookup
+    then matches on the y value within that much slack sideways, which is
+    the only coordinate that identifies the reading.
+    """
+    xs = np.asarray(xs, float)
+    ys = np.asarray(ys, float)
+    n = min(len(xs), len(ys), len(frame))
+    ax._bse_points = {
+        "x": xs[:n], "y": ys[:n],
+        "frame": frame.iloc[:n] if len(frame) > n else frame,
+        "label": label_col, "fields": fields, "x_slack": x_slack,
+        "note": note,
+    }
+
+
+def clear_points(ax):
+    ax._bse_points = None
+
+
+def _fmt_value(v):
+    """A value as a person would write it, not as repr() renders it."""
+    if v is None or (isinstance(v, float) and not np.isfinite(v)):
+        return "—"
+    if isinstance(v, (bool, np.bool_)):
+        return "yes" if v else "no"
+    if isinstance(v, (int, np.integer)):
+        return f"{int(v):d}"
+    if isinstance(v, (float, np.floating)):
+        a = abs(float(v))
+        if a and (a < 1e-3 or a >= 1e5):
+            return f"{v:.3g}"
+        return f"{float(v):.4g}"
+    try:
+        if pd.isna(v):
+            return "—"
+    except (TypeError, ValueError):
+        pass
+    return str(v)
+
+
+def point_at(ax, event):
+    """What was drawn where the mouse is, or None.
+
+    Returns ``(title, [(field, value), ...], (x, y), note)`` with the
+    position in data coordinates, so a caller can put the label beside the
+    point rather than beside the cursor.
+    """
+    reg = getattr(ax, "_bse_points", None)
+    if not reg or event is None or event.x is None:
+        return None
+    xs, ys = reg["x"], reg["y"]
+    if not len(xs):
+        return None
+    ok = np.isfinite(xs) & np.isfinite(ys)
+    if not ok.any():
+        return None
+    pix = ax.transData.transform(np.column_stack([np.where(ok, xs, 0.0),
+                                                  np.where(ok, ys, 0.0)]))
+    dx = pix[:, 0] - event.x
+    dy = pix[:, 1] - event.y
+    slack = reg.get("x_slack")
+    if slack:
+        p = ax.transData.transform([[0.0, 0.0], [float(slack), 0.0]])
+        slack_px = abs(p[1, 0] - p[0, 0])
+        d = np.where(ok & (np.abs(dx) <= slack_px), np.abs(dy), np.inf)
+    else:
+        d = np.where(ok, np.hypot(dx, dy), np.inf)
+    i = int(np.argmin(d))
+    if not np.isfinite(d[i]) or d[i] > PICK_RADIUS_PX:
+        return None
+    frame = reg["frame"]
+    row = frame.iloc[i]
+    label = reg.get("label")
+    if label and label in frame.columns:
+        title = _fmt_value(row[label])
+    else:
+        title = f"row {frame.index[i]}"
+    fields = reg.get("fields")
+    if fields is None:
+        fields = [c for c in frame.columns if not str(c).startswith("_")]
+    out = [(str(c).lstrip("_"), _fmt_value(row[c]))
+           for c in fields if c in frame.columns and c != label]
+    return title, out, (float(xs[i]), float(ys[i])), reg.get("note")
+
+
 class PlottingEngine:
     #: Chart types that compare predictions with measurements. They take
     #: the Metric as the measurement and *predicted_cols* as the models,
     #: so they bypass the usual group-and-test machinery entirely.
     MODEL_CHARTS = ("Model vs Measured", "Model vs Measured (bars)")
+
+    #: Charts that take over the axes completely — they place their own
+    #: ticks, labels and legend, and share none of the categorical
+    #: group / significance-bracket pipeline the others run through.
+    SELF_DRAWN = ("Heatmap", "Volcano Plot", "Dendrogram", "Network Graph",
+                  "Stacked Histogram", "Stacked Bar", "Density (overlaid)",
+                  "Ridge plot", "Venn diagram", "UpSet plot", "Bubble chart",
+                  "Dot plot")
+
+    #: The set charts. Both read the X groups as the sets and the Color-by
+    #: column as what is in them, so both need a Color-by column set.
+    SET_CHARTS = ("Venn diagram", "UpSet plot")
 
     #: Mean of the replicates at each X with error bars, drawn the way
     #: growth curves appear in papers: open markers, thin bars, one series
@@ -508,7 +627,7 @@ class PlottingEngine:
     @staticmethod
     def _draw_model_check(ax, df, label_col, measured_col, predicted_cols,
                           plot_type, pc, palette, log_scale, custom_title,
-                          text_color):
+                          text_color, fold_band=None):
         """Measured against one or more model columns."""
         from src import model_check
         cols = [c for c in predicted_cols if c and c != measured_col]
@@ -535,7 +654,31 @@ class PlottingEngine:
         else:
             model_check.draw_scatter(ax, table, measured_col, cols, colors,
                                      pc=pc, label_col=label_col,
-                                     log=log_scale or True)
+                                     log=log_scale or True,
+                                     band=fold_band)
+        if plot_type != "Model vs Measured (bars)":
+            st = model_check.summarise(table, measured_col, cols)
+            xs, ys, recs = [], [], []
+            meas = table[measured_col].to_numpy(float)
+            for c in cols:
+                if c not in st:
+                    continue
+                scaled = table[c].to_numpy(float) * st[c]["scale"]
+                xs.extend(meas.tolist())
+                ys.extend(scaled.tolist())
+                part = pd.DataFrame({
+                    "model": c,
+                    measured_col: meas,
+                    "predicted (scaled)": scaled,
+                    "fold off": np.where(meas > 0, scaled / meas, np.nan)})
+                if label_col and label_col in table.columns:
+                    part.insert(0, label_col, table[label_col].to_numpy())
+                recs.append(part)
+            if recs:
+                register_points(ax, xs, ys, pd.concat(recs, ignore_index=True),
+                                label_col=label_col if (
+                                    label_col and label_col in table.columns)
+                                else None)
         title = custom_title or f"{measured_col} — measured against model"
         if dropped:
             title += f"  ({dropped} row(s) dropped)"
@@ -553,9 +696,14 @@ class PlottingEngine:
                        error_style="Band (continuous)",
                        curve_measure="None", replicate_col=None,
                        curve_model=None, log_x=False, smooth_error=True,
-                       error_centre=None):
+                       error_centre=None, fold_band=None, size_col=None,
+                       dot_sort=True):
         """Generates plots while respecting active application theme states and overlays stars."""
         ax.clear()
+        # Whatever the last chart recorded for the click inspector is gone
+        # with the artists it described, and a stale position table would
+        # name the wrong row.
+        clear_points(ax)
 
         from src.theme import plot_colors
         pc = plot_colors(dark_mode)
@@ -577,7 +725,8 @@ class PlottingEngine:
         if plot_type in PlottingEngine.MODEL_CHARTS:
             PlottingEngine._draw_model_check(
                 ax, df, x_col, y_col, predicted_cols or [], plot_type, pc,
-                palette, log_scale, custom_title, text_color)
+                palette, log_scale, custom_title, text_color,
+                fold_band=fold_band)
             PlottingEngine._style_spines(ax, text_color)
             return
         if x_col == y_col:
@@ -661,6 +810,8 @@ class PlottingEngine:
                     ax, df, x_col, y_col, hue_col, replicate_col,
                     curve_measure, stat_mode, reference, text_color,
                     model=curve_model)
+            PlottingEngine._register_curve_points(
+                ax, df, x_col, y_col, hue_col, error_bars)
             ax.set_title(custom_title or f"{y_col} over {x_col}",
                          color=text_color, fontsize=11)
             if custom_xlabel:
@@ -675,7 +826,7 @@ class PlottingEngine:
         # --- Special plot types: these don't share the categorical group /
         # significance-overlay / xtick-rotation pipeline below, so they draw
         # themselves fully and return early. ---
-        if plot_type in ("Heatmap", "Volcano Plot", "Dendrogram", "Network Graph", "Stacked Histogram", "Stacked Bar"):
+        if plot_type in PlottingEngine.SELF_DRAWN:
             if plot_type == "Heatmap":
                 PlottingEngine._draw_heatmap(df, x_col, y_col, hue_col, ax, palette, text_color)
             elif plot_type == "Volcano Plot":
@@ -690,6 +841,45 @@ class PlottingEngine:
             elif plot_type == "Stacked Bar":
                 PlottingEngine._draw_stacked_bar(df, x_col, y_col, hue_col, ax, resolved_palette,
                                                    text_color, unique_groups, bw_mode, group_colors)
+            elif plot_type == "Density (overlaid)":
+                PlottingEngine._draw_density(
+                    df, x_col, y_col, hue_col, ax, resolved_palette,
+                    text_color, grid_color, color_categories,
+                    log_scale=log_scale)
+            elif plot_type == "Ridge plot":
+                PlottingEngine._draw_ridge(
+                    df, x_col, y_col, hue_col, ax, resolved_palette,
+                    text_color, grid_color, color_categories,
+                    log_scale=log_scale)
+            elif plot_type == "Venn diagram":
+                PlottingEngine._draw_venn(df, x_col, y_col, hue_col, ax,
+                                          resolved_palette, text_color)
+            elif plot_type == "UpSet plot":
+                PlottingEngine._draw_upset(df, x_col, y_col, hue_col, ax,
+                                           resolved_palette, text_color,
+                                           grid_color)
+            elif plot_type == "Bubble chart":
+                PlottingEngine._draw_bubble(
+                    df, x_col, y_col, hue_col, size_col, ax,
+                    resolved_palette, text_color, grid_color,
+                    color_categories if hue_col else None,
+                    log_scale=log_scale)
+            elif plot_type == "Dot plot":
+                PlottingEngine._draw_dotplot(
+                    df, x_col, y_col, hue_col, ax, resolved_palette,
+                    text_color, grid_color, unique_groups,
+                    color_categories if hue_col else None,
+                    error_bars=error_bars, log_scale=log_scale,
+                    sort_by_value=dot_sort)
+            # A custom title is offered on every chart, so the ones that
+            # set their own still have to honour it — and stay clickable,
+            # which is how it gets typed in the first place.
+            if custom_title:
+                ax.set_title(custom_title, color=text_color)
+            t = ax.title
+            if t.get_text():
+                t.set_picker(True)
+                t.set_url(f"edit_title:{y_col}")
             return
 
         hue_order = color_categories
@@ -727,6 +917,24 @@ class PlottingEngine:
             sns.swarmplot(data=df, x=x_col, y=y_col, hue=hue_col if hue_col else x_col, ax=ax,
                           palette=resolved_palette, size=4, alpha=0.6, order=unique_groups, hue_order=hue_order,
                           legend=legend_needed, dodge=bool(hue_col))
+        elif plot_type == "Raincloud":
+            PlottingEngine._draw_raincloud(
+                df, x_col, y_col, ax, unique_groups, hue_col,
+                resolved_palette, text_color,
+                hue_levels=color_categories if hue_col else None,
+                bw_mode=bw_mode)
+
+        # Where every row landed, for the click inspector. Done once here
+        # rather than inside each branch: on a categorical chart the x
+        # position is the group's slot and the y position is the reading,
+        # whichever of box, violin, swarm or bar was drawn over it.
+        if plot_type in ("Boxplot", "Violin", "Beeswarm", "Box + Swarm",
+                         "Bar", "Scatter"):
+            PlottingEngine._register_categorical(
+                ax, df, x_col, y_col, hue_col, unique_groups, plot_type)
+        elif plot_type == "Line":
+            PlottingEngine._register_curve_points(
+                ax, df, x_col, y_col, hue_col, error_bars)
 
         if log_scale:
             ax.set_yscale("log")
@@ -853,6 +1061,93 @@ class PlottingEngine:
             cur_bottom, cur_top = ax.get_ylim()
             ax.set_ylim(bottom=y_min if y_min is not None else cur_bottom,
                         top=y_max if y_max is not None else cur_top)
+
+    @staticmethod
+    def _register_curve_points(ax, df, x_col, y_col, hue_col, error_bars="SD"):
+        """The drawn markers of a curve chart: one mean per X per series.
+
+        A curve chart averages its replicates, so the point under the
+        cursor is not a row of the table — it is a summary. The label says
+        so by naming the number of replicates behind it alongside the
+        mean, rather than pretending to show one reading.
+        """
+        cols = [c for c in dict.fromkeys([x_col, y_col] +
+                                         ([hue_col] if hue_col else []))]
+        d = df[cols].copy()
+        for c in (x_col, y_col):
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+        d = d.dropna(subset=[x_col, y_col])
+        if d.empty:
+            return
+        keys = [x_col] + ([hue_col] if hue_col else [])
+        rows = []
+        for key, g in d.groupby(keys, sort=True):
+            key = key if isinstance(key, tuple) else (key,)
+            v = g[y_col].to_numpy(float)
+            err = PlottingEngine._spread(v, error_bars)
+            rec = {x_col: float(key[0]), "n": len(v),
+                   f"mean {y_col}": float(np.mean(v)),
+                   error_bars: float(err) if np.isfinite(err) else 0.0}
+            if hue_col:
+                rec[hue_col] = key[1]
+            rows.append(rec)
+        if not rows:
+            return
+        summary = pd.DataFrame(rows)
+        register_points(ax, summary[x_col].to_numpy(float),
+                        summary[f"mean {y_col}"].to_numpy(float),
+                        summary, label_col=hue_col if hue_col else None,
+                        note="mean of the replicates, not one reading")
+
+    @staticmethod
+    def _inspect_fields(frame, y_col, label_col=None):
+        """Which of a row's columns the click label prints, and in what
+        order: the measurement being plotted first, then the rest as the
+        sheet has them. The label itself is left out — it is the heading.
+        """
+        rest = [c for c in frame.columns
+                if c not in (y_col, label_col) and not str(c).startswith("_")]
+        return ([y_col] if y_col in frame.columns else []) + rest
+
+    @staticmethod
+    def _register_categorical(ax, df, x_col, y_col, hue_col, groups,
+                              plot_type):
+        """Record each row's drawn position for the click inspector.
+
+        For a scatter on a numeric X the position is simply the pair of
+        values. For everything else the X axis is categorical, so a row
+        sits in its group's slot — possibly jittered by a swarm or dodged
+        by a colour — and only the y value identifies which reading it is;
+        *x_slack* tells the lookup to match on y within the slot.
+        """
+        d = df.copy()
+        d[y_col] = pd.to_numeric(d[y_col], errors="coerce")
+        numeric_x = (plot_type == "Scatter"
+                     and pd.api.types.is_numeric_dtype(df[x_col]))
+        if numeric_x:
+            d[x_col] = pd.to_numeric(d[x_col], errors="coerce")
+            d = d.dropna(subset=[x_col, y_col])
+            if d.empty:
+                return
+            d = d.reset_index(drop=True)
+            register_points(ax, d[x_col].to_numpy(float),
+                            d[y_col].to_numpy(float), d,
+                            label_col=hue_col if hue_col else None,
+                            fields=PlottingEngine._inspect_fields(
+                                d, y_col, hue_col))
+            return
+        slots = {str(g): i for i, g in enumerate(groups)}
+        d = d.dropna(subset=[y_col])
+        d = d[d[x_col].astype(str).isin(slots)]
+        if d.empty:
+            return
+        xs = d[x_col].astype(str).map(slots).to_numpy(float)
+        d = d.reset_index(drop=True)
+        register_points(ax, xs, d[y_col].to_numpy(float), d,
+                        label_col=hue_col or x_col,
+                        fields=PlottingEngine._inspect_fields(
+                            d, y_col, hue_col or x_col),
+                        x_slack=0.5)
 
     @staticmethod
     def _style_spines(ax, color):
@@ -1224,6 +1519,17 @@ class PlottingEngine:
             ax.scatter(sub[x_col], sub["_neglog10p"], s=45, alpha=0.75,
                       color=color_map[cls], edgecolor="none", label=f"{cls} (n={len(sub)})")
 
+        # Every point, for the click inspector: on a volcano the label is
+        # the whole point of the chart, and there is room to annotate only
+        # the top handful of hits.
+        d["-log10(p)"] = d["_neglog10p"]
+        register_points(ax, d[x_col].to_numpy(float),
+                        d["_neglog10p"].to_numpy(float),
+                        d.reset_index(drop=True),
+                        label_col=hue_col if hue_col else None,
+                        fields=[x_col, y_col, "-log10(p)", "_class"],
+                        note="Up / Down at |log2FC| ≥ 1 and p < 0.05")
+
         ax.axhline(-np.log10(p_thresh), color=text_color, linestyle="--", linewidth=1, alpha=0.6)
         ax.axvline(fc_thresh, color=text_color, linestyle="--", linewidth=1, alpha=0.6)
         ax.axvline(-fc_thresh, color=text_color, linestyle="--", linewidth=1, alpha=0.6)
@@ -1339,7 +1645,10 @@ class PlottingEngine:
                 ax.plot([x1, x2], [y1, y2], color=edge_color, alpha=min(abs(r), 0.9),
                        linewidth=1 + abs(r) * 4, zorder=1)
 
-        node_colors = sns.color_palette(palette, n_colors=n)
+        # palette_colors(), not sns.color_palette(): the names in the
+        # Style tab are this app's own, and seaborn rejects every one of
+        # them — which made this chart unusable on the default palette.
+        node_colors = palette_colors(palette, n)
         for idx, col in enumerate(numeric_cols):
             x0, y0 = pos[col]
             ax.scatter([x0], [y0], s=900, color=node_colors[idx], edgecolor=text_color,
@@ -1364,15 +1673,731 @@ class PlottingEngine:
             for text in legend.get_texts():
                 text.set_color(text_color)
 
+    # ------------------------------------------------------------------
+    # Distributions: density, ridge, raincloud
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _kde(values, grid_n=256, pad=0.15):
+        """(grid, density) for *values*, or None when there is no spread.
+
+        A group of one replicate, or of several identical readings, has no
+        distribution to estimate — gaussian_kde raises on it. Returning
+        None lets the caller draw the value as the spike it actually is
+        instead of failing the whole figure.
+        """
+        v = np.asarray(values, float)
+        v = v[np.isfinite(v)]
+        if len(v) < 2:
+            return None
+        lo, hi = float(v.min()), float(v.max())
+        if hi - lo <= 0:
+            return None
+        try:
+            kde = stats.gaussian_kde(v)
+        except (ValueError, np.linalg.LinAlgError):
+            return None
+        span = hi - lo
+        grid = np.linspace(lo - pad * span, hi + pad * span, grid_n)
+        return grid, kde(grid)
+
+    @staticmethod
+    def _split_groups(df, y_col, split_col, levels):
+        """[(label, values array)] in the order *levels* asks for."""
+        vals = pd.to_numeric(df[y_col], errors="coerce")
+        d = pd.DataFrame({"_v": vals.to_numpy(),
+                          "_g": df[split_col].astype(str).to_numpy()}).dropna()
+        out = []
+        for g in levels:
+            sub = d.loc[d["_g"] == str(g), "_v"].to_numpy()
+            if len(sub):
+                out.append((str(g), sub))
+        return out
+
+    @staticmethod
+    def _draw_density(df, x_col, y_col, hue_col, ax, palette, text_color,
+                      grid_color, levels, log_scale=False, fill=True):
+        """One density curve per group, all on the same axes.
+
+        The comparison this chart is for is of shapes — whether two
+        conditions are shifted, or whether one is simply wider — so the
+        curves share an axis rather than being stacked. Every curve is a
+        kernel estimate, which smooths; the rug along the bottom shows
+        where the actual readings are, so a smooth hump drawn from four
+        points cannot be mistaken for a well-sampled one.
+        """
+        split = hue_col or x_col
+        ax.grid(True, linestyle="-", linewidth=0.8, color=grid_color)
+        ax.set_axisbelow(True)
+        series = PlottingEngine._split_groups(df, y_col, split, levels)
+        if not series:
+            ax.text(0.5, 0.5, f"No numeric values in '{y_col}' to draw a "
+                    "density from", ha="center", va="center",
+                    transform=ax.transAxes, color=text_color, fontsize=10)
+            return
+        for i, (label, v) in enumerate(series):
+            c = palette[i % len(palette)]
+            est = PlottingEngine._kde(v)
+            if est is None:
+                # A single distinct value: drawn as the vertical line it is.
+                ax.axvline(float(v[0]), color=c, lw=1.8,
+                           label=f"{label} (n={len(v)}, one value)")
+                continue
+            grid, dens = est
+            ax.plot(grid, dens, color=c, lw=1.9, zorder=3,
+                    label=f"{label} (n={len(v)})")
+            if fill:
+                ax.fill_between(grid, dens, color=c, alpha=0.16, zorder=2,
+                                linewidth=0)
+            # the readings themselves, as a rug under the curve
+            ax.plot(v, np.full(len(v), 0.0), marker="|", linestyle="none",
+                    markersize=6, color=c, alpha=0.7, zorder=4,
+                    markeredgewidth=1.1)
+        ax.set_ylim(bottom=0)
+        ax.set_ylabel("Density", fontsize=11, color=text_color)
+        ax.set_xlabel(y_col, fontsize=11, color=text_color)
+        ax.set_title(f"Distribution of {y_col} by {split}", fontsize=13,
+                     pad=14, color=text_color)
+        if log_scale:
+            ax.set_xscale("log")
+        leg = ax.legend(title=split, fontsize=8.5, title_fontsize=9,
+                        frameon=False)
+        if leg:
+            for t in leg.get_texts():
+                t.set_color(text_color)
+                t.set_picker(True)
+                t.set_url("group_color:" + t.get_text().split(" (n=")[0])
+            leg.get_title().set_color(text_color)
+        PlottingEngine._style_spines(ax, text_color)
+
+    @staticmethod
+    def _draw_ridge(df, x_col, y_col, hue_col, ax, palette, text_color,
+                    grid_color, levels, log_scale=False, overlap=1.5):
+        """Densities on their own baselines, stacked down the axes.
+
+        The same estimates as the density chart, separated so that a dozen
+        conditions stay readable where a dozen overlaid curves would not.
+        Each curve is scaled to the same height, so the picture is of
+        *where* each group sits and how wide it is — heights carry no
+        information and are deliberately not comparable.
+        """
+        split = hue_col or x_col
+        series = PlottingEngine._split_groups(df, y_col, split, levels)
+        if not series:
+            ax.text(0.5, 0.5, f"No numeric values in '{y_col}' to draw a "
+                    "ridge plot from", ha="center", va="center",
+                    transform=ax.transAxes, color=text_color, fontsize=10)
+            return
+        ax.grid(False)
+        ax.xaxis.grid(True, linestyle="-", linewidth=0.8, color=grid_color)
+        ax.set_axisbelow(True)
+        n = len(series)
+        ticks, labels = [], []
+        # Top row first, and drawn last-to-first so a lower curve overlaps
+        # the one above it rather than being hidden behind it.
+        for i, (label, v) in reversed(list(enumerate(series))):
+            base = float(n - 1 - i)
+            c = palette[i % len(palette)]
+            ticks.append(base)
+            labels.append(f"{label}  (n={len(v)})")
+            est = PlottingEngine._kde(v)
+            z = 3 + i
+            if est is None:
+                ax.plot([float(v[0])] * 2, [base, base + overlap * 0.6],
+                        color=c, lw=1.8, zorder=z)
+            else:
+                grid, dens = est
+                peak = float(dens.max()) or 1.0
+                curve = base + overlap * dens / peak
+                ax.fill_between(grid, base, curve, color=c, alpha=0.75,
+                                zorder=z, linewidth=0)
+                ax.plot(grid, curve, color=text_color, lw=0.9, alpha=0.8,
+                        zorder=z + 0.1)
+            ax.axhline(base, color=text_color, lw=0.7, alpha=0.35,
+                       zorder=z - 0.5, xmin=0, xmax=1)
+            med = float(np.median(v))
+            ax.plot([med], [base], marker="v", markersize=5, color=text_color,
+                    zorder=z + 0.2, clip_on=False)
+            ax.plot(v, np.full(len(v), base - 0.07), marker="|",
+                    linestyle="none", markersize=5, color=text_color,
+                    alpha=0.6, markeredgewidth=0.9, zorder=z + 0.2)
+        ax.set_yticks(ticks)
+        ax.set_yticklabels(labels, fontsize=9.5, color=text_color)
+        for lab in ax.get_yticklabels():
+            lab.set_picker(True)
+            lab.set_url("group_color:" + lab.get_text().split("  (n=")[0])
+        ax.set_ylim(-0.4, n - 1 + overlap + 0.25)
+        ax.set_xlabel(y_col, fontsize=11, color=text_color)
+        ax.set_ylabel("")
+        ax.set_title(f"{y_col} by {split}", fontsize=13, pad=14,
+                     color=text_color)
+        if log_scale:
+            ax.set_xscale("log")
+        for side in ("top", "right", "left"):
+            ax.spines[side].set_visible(False)
+        ax.spines["bottom"].set_color(text_color)
+        ax.tick_params(axis="y", length=0, colors=text_color)
+        ax.tick_params(axis="x", colors=text_color)
+        ax.text(0.995, 0.005, "Curves scaled to equal height — "
+                "the marker is the median",
+                transform=ax.transAxes, ha="right", va="bottom", fontsize=7,
+                color=text_color, alpha=0.7, style="italic")
+
+    @staticmethod
+    def _draw_raincloud(df, x_col, y_col, ax, groups, hue_col, palette,
+                        text_color, hue_levels=None, bw_mode=False):
+        """Half violin, box and raw points, side by side per group.
+
+        A box plot hides whether a group is bimodal; a swarm hides the
+        quartiles; and either alone hides how few points there are. The
+        raincloud shows all three at once, which is why it is worth the
+        width it takes: the cloud is the estimated shape, the box is the
+        summary that gets quoted, and the rain is every reading that went
+        into both.
+        """
+        # The whole row, not only the columns being drawn: clicking a
+        # point is for finding out which sample it is, and the well, the
+        # plate and the date are exactly what identifies it.
+        d = df.copy()
+        d[y_col] = pd.to_numeric(d[y_col], errors="coerce")
+        d = d.dropna(subset=[y_col])
+        if d.empty:
+            ax.text(0.5, 0.5, f"No numeric values in '{y_col}'", ha="center",
+                    va="center", transform=ax.transAxes, color=text_color)
+            return
+        levels = [str(h) for h in (hue_levels or [])] if hue_col else [None]
+        width = 0.8 / max(len(levels), 1)
+        rng = np.random.default_rng(0)        # same jitter on every redraw
+        px, py, rows = [], [], []
+        for gi, g in enumerate(groups):
+            in_group = d[x_col].astype(str) == str(g)
+            for li, lv in enumerate(levels):
+                sub = d[in_group] if lv is None else \
+                    d[in_group & (d[hue_col].astype(str) == lv)]
+                v = sub[y_col].to_numpy(float)
+                if not len(v):
+                    continue
+                c = palette[(li if hue_col else gi) % len(palette)]
+                centre = gi + (li - (len(levels) - 1) / 2) * width
+                half = width * 0.42
+                est = PlottingEngine._kde(v)
+                if est is not None:
+                    grid, dens = est
+                    inside = (grid >= v.min()) & (grid <= v.max())
+                    grid, dens = grid[inside], dens[inside]
+                    if len(grid) > 1:
+                        peak = float(dens.max()) or 1.0
+                        edge = centre + 0.06 * width + half * dens / peak
+                        ax.fill_betweenx(grid, centre + 0.06 * width, edge,
+                                         color=c, alpha=0.55, linewidth=0,
+                                         zorder=2)
+                        ax.plot(edge, grid, color=c, lw=1.0, zorder=2.1)
+                # the box, narrow, on the centre line
+                bp = ax.boxplot([v], positions=[centre - 0.06 * width],
+                                widths=half * 0.45,
+                                patch_artist=True, showfliers=False,
+                                medianprops=dict(color=text_color, lw=1.3),
+                                whiskerprops=dict(color=text_color, lw=1.0),
+                                capprops=dict(color=text_color, lw=1.0),
+                                zorder=3)
+                for box in bp["boxes"]:
+                    box.set_facecolor("none")
+                    box.set_edgecolor(text_color)
+                    box.set_linewidth(1.0)
+                # the rain
+                jx = centre - 0.06 * width - half * (0.55 + rng.random(len(v)) * 0.45)
+                ax.plot(jx, v, marker="o", linestyle="none", markersize=4.2,
+                        color=c, alpha=0.75, markeredgecolor="none", zorder=4,
+                        label=(lv if (hue_col and gi == 0) else None))
+                px.extend(jx.tolist())
+                py.extend(v.tolist())
+                rows.append(sub)
+        if rows:
+            whole = pd.concat(rows, ignore_index=True)
+            register_points(ax, px, py, whole, label_col=hue_col or x_col,
+                            fields=PlottingEngine._inspect_fields(
+                                whole, y_col, hue_col or x_col),
+                            x_slack=0.45)
+        ax.set_xticks(range(len(groups)))
+        ax.set_xlim(-0.6, len(groups) - 0.4)
+        return True
+
+    # ------------------------------------------------------------------
+    # Set charts: Venn and UpSet
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _member_sets(df, x_col, hue_col):
+        """{set name: {members}} — X groups are the sets, Color by the members.
+
+        Long-format tables are what this app reads, so a set is "the rows
+        belonging to this condition" and a member is the thing being
+        counted in it: the gene, the construct, the strain. Without a
+        Color-by column there is nothing to intersect — rows are not
+        comparable across conditions — which is what the callers report.
+        """
+        if not hue_col or hue_col not in df.columns:
+            return {}
+        d = df[[x_col, hue_col]].dropna()
+        if d.empty:
+            return {}
+        out = {}
+        for g, sub in d.groupby(d[x_col].astype(str), sort=False):
+            members = set(sub[hue_col].astype(str))
+            if members:
+                out[str(g)] = members
+        return out
+
+    @staticmethod
+    def _set_chart_note(ax, x_col, hue_col, n_sets, text_color, upto):
+        """The message when Venn/UpSet has not been given what it needs."""
+        if not hue_col:
+            msg = ("Set 'Color by' to the column naming what is in each "
+                   f"set — a gene, construct or strain.\n\nThe X groups "
+                   f"('{x_col}') become the sets; the Color-by values "
+                   "become their members.")
+        elif n_sets == 0:
+            msg = (f"No rows with both '{x_col}' and '{hue_col}' filled in.")
+        elif n_sets < 2:
+            msg = (f"Only one set ('{x_col}' has a single value here) — "
+                   "there is nothing to intersect.")
+        else:
+            msg = (f"{n_sets} sets is more than a Venn diagram can draw "
+                   f"honestly (up to {upto}).\nUse the UpSet plot, which "
+                   "handles any number of sets.")
+        ax.text(0.5, 0.5, msg, ha="center", va="center",
+                transform=ax.transAxes, color=text_color, fontsize=10,
+                wrap=True, linespacing=1.5)
+        ax.axis("off")
+
+    @staticmethod
+    def _draw_venn(df, x_col, y_col, hue_col, ax, palette, text_color):
+        """Two or three sets as overlapping circles, with exact counts.
+
+        The circles are fixed in size and position: drawing them to scale
+        is impossible for most three-set data, and a diagram that is
+        almost-to-scale invites reading areas that are not true. The
+        numbers are exact and are what the figure is for.
+        """
+        sets = PlottingEngine._member_sets(df, x_col, hue_col)
+        names = list(sets)
+        if len(names) not in (2, 3):
+            PlottingEngine._set_chart_note(ax, x_col, hue_col, len(names),
+                                           text_color, upto=3)
+            return
+        ax.grid(False)
+        ax.axis("off")
+        ax.set_aspect("equal")
+        from matplotlib.patches import Circle
+
+        def count(include, exclude):
+            s = set.intersection(*[sets[n] for n in include])
+            for n in exclude:
+                s = s - sets[n]
+            return len(s)
+
+        if len(names) == 2:
+            a, b = names
+            centres = [(-0.30, 0.0), (0.30, 0.0)]
+            r = 0.52
+            regions = [((-0.62, 0.0), count([a], [b])),
+                       ((0.62, 0.0), count([b], [a])),
+                       ((0.0, 0.0), count([a, b], []))]
+            label_pos = [(-0.62, 0.62), (0.62, 0.62)]
+            union = len(sets[a] | sets[b])
+            inter = count([a, b], [])
+            caption = (f"{inter} shared of {union} in total — "
+                       f"Jaccard {inter / union:.2f}" if union else "")
+        else:
+            a, b, c = names
+            r = 0.50
+            ang = np.deg2rad([150.0, 30.0, 270.0])
+            centres = [(0.29 * np.cos(t), 0.29 * np.sin(t)) for t in ang]
+            singles = [(0.537 * np.cos(t), 0.537 * np.sin(t)) for t in ang]
+            pair_ang = np.deg2rad([90.0, 210.0, 330.0])      # ab, ac, bc
+            pairs = [(0.31 * np.cos(t), 0.31 * np.sin(t)) for t in pair_ang]
+            regions = [
+                (singles[0], count([a], [b, c])),
+                (singles[1], count([b], [a, c])),
+                (singles[2], count([c], [a, b])),
+                (pairs[0], count([a, b], [c])),
+                (pairs[1], count([a, c], [b])),
+                (pairs[2], count([b, c], [a])),
+                ((0.0, 0.0), count([a, b, c], [])),
+            ]
+            label_pos = [(x * 1.65, y * 1.65 + (0.12 if y > 0 else -0.12))
+                         for x, y in centres]
+            union = len(set.union(*sets.values()))
+            caption = (f"{count([a, b, c], [])} in all three, "
+                       f"{union} distinct {hue_col} values in total")
+
+        for i, (cx, cy) in enumerate(centres):
+            col = palette[i % len(palette)]
+            ax.add_patch(Circle((cx, cy), r, facecolor=col, alpha=0.38,
+                                edgecolor=col, linewidth=1.8, zorder=2))
+        for (px, py), n in regions:
+            if n == 0:
+                continue
+            ax.text(px, py, str(n), ha="center", va="center", fontsize=13,
+                    fontweight="bold", color=text_color, zorder=4)
+        for i, (px, py) in enumerate(label_pos):
+            ax.text(px, py, names[i], ha="center", va="center", fontsize=10.5,
+                    fontweight="semibold", color=palette[i % len(palette)],
+                    zorder=4)
+        lim = 1.25
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim * 0.95, lim * 0.95)
+        ax.set_title(f"{hue_col} shared between {x_col} groups", fontsize=13,
+                     pad=12, color=text_color)
+        if caption:
+            ax.text(0.5, -0.02, caption, transform=ax.transAxes, ha="center",
+                    va="top", fontsize=8.5, color=text_color, alpha=0.8)
+
+    @staticmethod
+    def _draw_upset(df, x_col, y_col, hue_col, ax, palette, text_color,
+                    grid_color, max_cols=18):
+        """Intersection sizes as bars over a membership matrix.
+
+        What a Venn diagram cannot do past three sets. Each column is one
+        exact combination — the members in these sets and no others — so
+        the columns partition the data and their sizes add up to the
+        total, which is not true of the overlapping regions people usually
+        read off a Venn.
+        """
+        sets = PlottingEngine._member_sets(df, x_col, hue_col)
+        names = list(sets)
+        if len(names) < 2:
+            PlottingEngine._set_chart_note(ax, x_col, hue_col, len(names),
+                                           text_color, upto=3)
+            return
+        ax.grid(False)
+        ax.axis("off")
+        # Every member's exact signature: which sets it is in.
+        combos = {}
+        for member in set.union(*sets.values()):
+            sig = tuple(n for n in names if member in sets[n])
+            combos.setdefault(sig, []).append(member)
+        order = sorted(combos, key=lambda s: (-len(combos[s]), len(s)))
+        hidden = max(0, len(order) - max_cols)
+        order = order[:max_cols]
+        # Sets ordered by their own size, largest at the bottom row, which
+        # is where an UpSet plot conventionally puts it.
+        rows = sorted(names, key=lambda n: len(sets[n]), reverse=True)
+        n_rows, n_cols = len(rows), len(order)
+
+        # The set names are the matrix's y tick labels, so they are drawn
+        # in the gap to its left — which is why the size bars stop short of
+        # it rather than running up to the dots.
+        bars = ax.inset_axes([0.34, 0.42, 0.65, 0.56])
+        mat = ax.inset_axes([0.34, 0.06, 0.65, 0.34], sharex=bars)
+        # Not sharey with the matrix: clearing this panel's ticks would
+        # clear the shared locator, and the set names are those ticks.
+        side = ax.inset_axes([0.00, 0.06, 0.18, 0.34])
+        for sub in (bars, mat, side):
+            sub.set_facecolor("none")
+            sub.tick_params(colors=text_color, labelsize=8.5)
+
+        sizes = [len(combos[s]) for s in order]
+        bars.bar(range(n_cols), sizes, width=0.62, color=palette[0 % len(palette)],
+                 edgecolor="none", zorder=3)
+        for i, v in enumerate(sizes):
+            bars.text(i, v, str(v), ha="center", va="bottom", fontsize=8,
+                      color=text_color)
+        bars.set_ylim(0, max(sizes) * 1.18)
+        bars.yaxis.grid(True, linestyle="-", linewidth=0.8, color=grid_color)
+        bars.set_axisbelow(True)
+        bars.set_ylabel("Intersection", fontsize=9.5, color=text_color)
+        bars.tick_params(labelbottom=False, bottom=False)
+        for s in ("top", "right", "bottom"):
+            bars.spines[s].set_visible(False)
+        bars.spines["left"].set_color(text_color)
+
+        dim = mcolors.to_rgba(text_color, 0.16)
+        for j, sig in enumerate(order):
+            members = [i for i, nm in enumerate(rows) if nm in sig]
+            mat.plot([j] * n_rows, range(n_rows), marker="o", linestyle="none",
+                     markersize=7, color=dim, markeredgecolor="none", zorder=2)
+            if members:
+                mat.plot([j, j], [min(members), max(members)], color=text_color,
+                         lw=1.6, zorder=3)
+                mat.plot([j] * len(members), members, marker="o",
+                         linestyle="none", markersize=7, color=text_color,
+                         markeredgecolor="none", zorder=4)
+        mat.set_xlim(-0.6, n_cols - 0.4)
+        mat.set_ylim(-0.6, n_rows - 0.4)
+        mat.set_yticks(range(n_rows))
+        mat.set_yticklabels(rows, fontsize=9, color=text_color)
+        mat.set_xticks([])
+        for s in mat.spines.values():
+            s.set_visible(False)
+        mat.tick_params(length=0)
+
+        side.barh(range(n_rows), [len(sets[n]) for n in rows], height=0.55,
+                  color=palette[1 % len(palette)], edgecolor="none", zorder=3)
+        side.invert_xaxis()
+        side.set_ylim(mat.get_ylim())
+        side.tick_params(left=False, labelleft=False)
+        side.set_xlabel("Set size", fontsize=9, color=text_color)
+        side.xaxis.grid(True, linestyle="-", linewidth=0.8, color=grid_color)
+        side.set_axisbelow(True)
+        for s in ("top", "right", "left"):
+            side.spines[s].set_visible(False)
+        side.spines["bottom"].set_color(text_color)
+        side.tick_params(labelsize=8)
+
+        ax.set_title(f"{hue_col} shared between {x_col} groups", fontsize=13,
+                     pad=12, color=text_color)
+        note = ("Each column is one exact combination, so the columns add up "
+                "to the total")
+        if hidden:
+            note += f" — {hidden} smaller combination(s) not shown"
+        ax.text(0.5, -0.07, note, transform=ax.transAxes, ha="center",
+                va="top", fontsize=8, color=text_color, alpha=0.8)
+
+    # ------------------------------------------------------------------
+    # Bubble and dot plots
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _draw_bubble(df, x_col, y_col, hue_col, size_col, ax, palette,
+                     text_color, grid_color, levels, log_scale=False):
+        """Scatter with a third measurement in the marker area.
+
+        Area, not radius: the eye reads a bubble by how much ink it is, so
+        scaling the radius exaggerates large values about fourfold. The
+        legend shows three real values from the data at their drawn size,
+        because no one can read an area off an axis.
+        """
+        ax.grid(True, linestyle="-", linewidth=0.8, color=grid_color)
+        ax.set_axisbelow(True)
+        if not size_col or size_col not in df.columns:
+            ax.text(0.5, 0.5, "Choose a 'Bubble size' column — the third "
+                    "measurement,\ndrawn as the area of each point.",
+                    ha="center", va="center", transform=ax.transAxes,
+                    color=text_color, fontsize=10, linespacing=1.5)
+            return
+        cols = list(dict.fromkeys([c for c in (x_col, y_col, size_col, hue_col)
+                                   if c]))
+        d = df[cols].copy()
+        for c in (x_col, y_col, size_col):
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+        d = d.dropna(subset=[y_col, size_col])
+        numeric_x = d[x_col].notna().any()
+        if not numeric_x:
+            d = df[cols].copy()
+            d[y_col] = pd.to_numeric(d[y_col], errors="coerce")
+            d[size_col] = pd.to_numeric(d[size_col], errors="coerce")
+            d = d.dropna(subset=[y_col, size_col])
+        if d.empty:
+            ax.text(0.5, 0.5, f"'{y_col}' and '{size_col}' need numeric "
+                    "values in the same rows", ha="center", va="center",
+                    transform=ax.transAxes, color=text_color, fontsize=10)
+            return
+        s_raw = d[size_col].to_numpy(float)
+        lo, hi = float(np.nanmin(s_raw)), float(np.nanmax(s_raw))
+        S_MIN, S_MAX = 40.0, 900.0
+        if hi > lo:
+            area = S_MIN + (s_raw - lo) / (hi - lo) * (S_MAX - S_MIN)
+        else:
+            area = np.full(len(s_raw), (S_MIN + S_MAX) / 2)
+        if numeric_x:
+            xpos = d[x_col].to_numpy(float)
+            cats = None
+        else:
+            cats = [str(g) for g in dict.fromkeys(df[x_col].astype(str))
+                    if str(g) in set(d[x_col].astype(str))]
+            index = {g: i for i, g in enumerate(cats)}
+            xpos = d[x_col].astype(str).map(index).to_numpy(float)
+        if hue_col and hue_col in d.columns:
+            keys = [str(v) for v in (levels or [])]
+            colmap = {k: palette[i % len(palette)] for i, k in enumerate(keys)}
+            colors = [colmap.get(str(v), palette[0]) for v in d[hue_col]]
+        else:
+            colors = [palette[0 % len(palette)]] * len(d)
+        ax.scatter(xpos, d[y_col].to_numpy(float), s=area, c=colors,
+                   alpha=0.62, edgecolor=text_color, linewidth=0.6, zorder=3)
+        register_points(ax, xpos, d[y_col].to_numpy(float),
+                        d.reset_index(drop=True),
+                        label_col=hue_col if hue_col else None)
+        if cats is not None:
+            ax.set_xticks(range(len(cats)))
+            ax.set_xticklabels(cats, rotation=45, ha="right", fontsize=10)
+            ax.set_xlim(-0.6, len(cats) - 0.4)
+        if log_scale:
+            ax.set_yscale("log")
+        # A size key, from three values actually present in the data.
+        from matplotlib.lines import Line2D
+        qs = np.nanpercentile(s_raw, [5, 50, 95])
+        keyed, seen = [], set()
+        for v in qs:
+            r = float(np.round(v, 3 - int(np.floor(np.log10(abs(v)))) - 1)
+                      if np.isfinite(v) and v != 0 else v)
+            if r in seen:
+                continue
+            seen.add(r)
+            a = (S_MIN + (v - lo) / (hi - lo) * (S_MAX - S_MIN)) if hi > lo \
+                else (S_MIN + S_MAX) / 2
+            keyed.append(Line2D([0], [0], marker="o", linestyle="none",
+                                markerfacecolor="none",
+                                markeredgecolor=text_color,
+                                markersize=float(np.sqrt(a)), label=f"{r:g}"))
+        if keyed:
+            key = ax.legend(handles=keyed, title=size_col, loc="upper left",
+                            frameon=False, labelspacing=1.6, fontsize=8.5,
+                            title_fontsize=9, handletextpad=1.4,
+                            borderpad=0.9)
+            key.get_title().set_color(text_color)
+            for t in key.get_texts():
+                t.set_color(text_color)
+            ax.add_artist(key)
+        if hue_col:
+            handles = [Line2D([0], [0], marker="o", linestyle="none",
+                              color=palette[i % len(palette)],
+                              markersize=7, label=str(k))
+                       for i, k in enumerate(levels or [])]
+            if handles:
+                leg = ax.legend(handles=handles, title=hue_col, fontsize=8.5,
+                                title_fontsize=9, frameon=False,
+                                loc="lower right")
+                leg.get_title().set_color(text_color)
+                for t, k in zip(leg.get_texts(), levels or []):
+                    t.set_color(text_color)
+                    t.set_picker(True)
+                    t.set_url("group_color:" + str(k))
+        ax.set_xlabel(x_col, fontsize=11, color=text_color)
+        ax.set_ylabel(y_col, fontsize=11, color=text_color)
+        ax.set_title(f"{y_col} vs {x_col}, sized by {size_col}", fontsize=13,
+                     pad=14, color=text_color)
+        PlottingEngine._style_spines(ax, text_color)
+
+    @staticmethod
+    def _draw_dotplot(df, x_col, y_col, hue_col, ax, palette, text_color,
+                      grid_color, groups, levels, error_bars="95% CI",
+                      log_scale=False, sort_by_value=True):
+        """Group means on a horizontal axis, one row per group.
+
+        A Cleveland dot plot. It answers the same question as a bar chart
+        with a fraction of the ink, reads cleanly with thirty groups where
+        bars do not, and — because it is not anchored at zero — does not
+        imply that zero is meaningful for a ratio or a normalised value.
+        The interval is drawn so the dots are not read as exact.
+        """
+        ax.grid(False)
+        ax.xaxis.grid(True, linestyle="-", linewidth=0.8, color=grid_color)
+        ax.set_axisbelow(True)
+        d = df[[c for c in dict.fromkeys([x_col, y_col] +
+                                         ([hue_col] if hue_col else []))]].copy()
+        d[y_col] = pd.to_numeric(d[y_col], errors="coerce")
+        d = d.dropna(subset=[y_col])
+        if d.empty:
+            ax.text(0.5, 0.5, f"No numeric values in '{y_col}'", ha="center",
+                    va="center", transform=ax.transAxes, color=text_color)
+            return
+        series = [None] if not hue_col else [str(h) for h in (levels or [])]
+        stats_rows = []
+        for g in groups:
+            in_g = d[x_col].astype(str) == str(g)
+            for lv in series:
+                sub = d[in_g] if lv is None else \
+                    d[in_g & (d[hue_col].astype(str) == lv)]
+                v = sub[y_col].to_numpy(float)
+                if not len(v):
+                    continue
+                err = PlottingEngine._spread(v, error_bars)
+                stats_rows.append({"_group": str(g), "_series": lv,
+                                   "n": len(v), "mean": float(np.mean(v)),
+                                   "err": float(err) if np.isfinite(err) else 0.0})
+        if not stats_rows:
+            ax.text(0.5, 0.5, "Nothing to summarise", ha="center", va="center",
+                    transform=ax.transAxes, color=text_color)
+            return
+        summary = pd.DataFrame(stats_rows)
+        order = list(dict.fromkeys(summary["_group"]))
+        if sort_by_value:
+            # Largest at the top, which is how a ranked list is read.
+            rank = summary.groupby("_group")["mean"].max().sort_values()
+            order = list(rank.index)
+        pos = {g: i for i, g in enumerate(order)}
+        px, py = [], []
+        for li, lv in enumerate(series):
+            part = summary[summary["_series"] == lv] if lv is not None \
+                else summary
+            if part.empty:
+                continue
+            off = 0.0 if lv is None else \
+                (li - (len(series) - 1) / 2) * (0.7 / max(len(series), 1))
+            ys = [pos[g] + off for g in part["_group"]]
+            c = palette[li % len(palette)] if hue_col else None
+            for j, (g, m, e) in enumerate(zip(part["_group"], part["mean"],
+                                              part["err"])):
+                colour = c if c is not None else \
+                    palette[list(order).index(g) % len(palette)]
+                y = pos[g] + off
+                if e:
+                    ax.plot([m - e, m + e], [y, y], color=colour, lw=1.5,
+                            alpha=0.85, zorder=2,
+                            solid_capstyle="butt")
+                ax.plot([m], [y], marker="o", markersize=8, color=colour,
+                        markeredgecolor=text_color, markeredgewidth=0.7,
+                        zorder=3, linestyle="none",
+                        label=(str(lv) if (hue_col and j == 0) else None))
+                px.append(m)
+                py.append(y)
+        register_points(ax, px, py, summary.reset_index(drop=True),
+                        label_col="_group",
+                        fields=["_series", "n", "mean", "err"])
+        # The guide lines run from the left spine to each dot, so they are
+        # drawn once the axis has settled on its range. Earlier they would
+        # have been anchored to a default limit and dragged the axis out to
+        # it — on a fold change or a normalised value that means implying
+        # zero is on the scale when it is not.
+        ax.relim()
+        ax.autoscale_view(scalex=True, scaley=False)
+        left = ax.get_xlim()[0]
+        for m, y in zip(px, py):
+            ax.plot([left, m], [y, y], color=text_color, lw=0.7, alpha=0.18,
+                    zorder=0)
+        ax.set_xlim(left=left)
+        ax.set_yticks(range(len(order)))
+        ax.set_yticklabels([str(g) for g in order], fontsize=10,
+                           color=text_color)
+        for lab in ax.get_yticklabels():
+            lab.set_picker(True)
+            lab.set_url("group_color:" + lab.get_text())
+        ax.set_ylim(-0.6, len(order) - 0.4)
+        if log_scale:
+            ax.set_xscale("log")
+        ax.set_xlabel(f"{y_col}  (mean ± {error_bars})", fontsize=11,
+                      color=text_color)
+        ax.set_ylabel("")
+        ax.set_title(f"{y_col} by {x_col}", fontsize=13, pad=14,
+                     color=text_color)
+        if hue_col:
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                leg = ax.legend(title=hue_col, fontsize=8.5,
+                                title_fontsize=9, frameon=False)
+                leg.get_title().set_color(text_color)
+                for t, lbl in zip(leg.get_texts(), labels):
+                    t.set_color(text_color)
+                    t.set_picker(True)
+                    t.set_url("group_color:" + lbl)
+        for side in ("top", "right", "left"):
+            ax.spines[side].set_visible(False)
+        ax.spines["bottom"].set_color(text_color)
+        ax.tick_params(axis="y", length=0, colors=text_color)
+        ax.tick_params(axis="x", colors=text_color)
+
     # Dodge width used by each chart type when a Color-By column is set
     # (where each colour's bar/box sits inside its x group)
     DODGE_WIDTH = {"Bar": 0.8, "Boxplot": 0.5, "Violin": 0.8,
-                   "Beeswarm": 0.8, "Box + Swarm": 0.8}
+                   "Beeswarm": 0.8, "Box + Swarm": 0.8, "Raincloud": 0.8}
     MAX_BRACKETS = 15
     #: The chart types significance brackets can be drawn on. The rest are
     #: either not group comparisons (Line, Scatter, Heatmap, Volcano…) or
     #: draw themselves whole (Stacked Bar, the model checks).
-    STAT_CHARTS = ["Boxplot", "Violin", "Beeswarm", "Box + Swarm", "Bar"]
+    STAT_CHARTS = ["Boxplot", "Violin", "Beeswarm", "Box + Swarm", "Bar",
+                   "Raincloud"]
 
     @staticmethod
     def _stat_note(ax, text, line_color):

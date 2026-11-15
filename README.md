@@ -50,6 +50,44 @@ changes asks to save.
   points afterwards: they are added to the same plates. Corrections are
   applied plate by plate.
 
+## Graph types
+
+Bar, box, violin, beeswarm, box + swarm, **raincloud**, **dot plot**,
+scatter, **bubble chart**, line, growth curve, **density (overlaid)**,
+**ridge plot**, stacked bar, stacked histogram, heatmap, volcano,
+dendrogram, correlation network, **Venn diagram**, **UpSet plot**, and
+the two model-vs-measured charts. Significance brackets are drawn on
+bar, box, violin, beeswarm, box + swarm and raincloud.
+
+A few need a column that the others do not:
+
+* **Bubble chart** takes a *Bubble size* column — a third measurement,
+  drawn as the **area** of each point (not the radius, which would
+  exaggerate large values about fourfold). The key shows three real
+  values from the data at their drawn size.
+* **Venn diagram** and **UpSet plot** read the **X groups as the sets**
+  and **Color by as what is in them** (a gene, a construct, a strain).
+  Venn draws two or three sets with exact counts; UpSet handles any
+  number, one column per exact combination — so the columns add up to
+  the total, which the overlapping regions of a Venn do not.
+* **Ridge plot** scales every curve to the same height, so heights are
+  not comparable between rows; positions and widths are.
+* **Dot plot** is not anchored at zero, which is why it suits fold
+  changes and normalised values that bars would misrepresent.
+
+## Clicking a point
+
+Click any data point to have it named: the label gives the row's
+identifier and its values, straight from the sheet. It works the same on
+a volcano point, a bubble, a dot in a swarm or a raincloud, a scatter
+point and a point on the model-vs-measured chart. On a line or growth
+curve the markers are means, and the label says so — it gives the mean,
+the error and the number of replicates behind it rather than pretending
+to show one reading. Click anywhere else to take the label away.
+
+Clicking the **title**, an **axis label** or a **group name** still edits
+or recolours it as before; where the two overlap, the editable text wins.
+
 ## Curves
 
 Curve fitting lives on the **Plotting Dashboard** — chart type *Growth

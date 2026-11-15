@@ -1,4 +1,47 @@
 # run.py
+"""BioStat Explorer — the application window.
+
+----------------------------------------------------------------------
+HOW THE APP IS PUT TOGETHER
+----------------------------------------------------------------------
+This file is the window only. Everything that knows anything lives in
+src/ and is importable without Qt:
+
+    excel_loader       files  -> DataFrame
+    plate_reader (pr)  finds the 8x12 grids inside a plate-reader export
+    normalization      blank subtraction, OD normalisation
+    filters            row filtering
+    curves             growth and dose-response fitting
+    statistics_engine  which test to run, and running it
+    plotting           the figures
+    export_engine /
+    report_generator   CSV, Excel, PDF out
+    project            save and load a .bse file
+
+The window holds one DataFrame, self.df, and that is the single source
+of truth. Every panel reads from it; anything that changes it goes
+through the undo checkpoint first. Plate import builds a *new* df;
+corrections and filters replace it.
+
+The three tabs are:
+
+    Data                 the table, plus the plate-reader importer
+    Plotting Dashboard   the figure, its controls and the statistics
+    Layout               several finished figures arranged on one page
+
+----------------------------------------------------------------------
+TWO CONVENTIONS WORTH KNOWING BEFORE READING ON
+----------------------------------------------------------------------
+* Signals are blocked (`blockSignals(True)`) around any code that
+  rebuilds a combo box or a table. Qt emits "changed" while a widget is
+  being repopulated, and without the guard the app redraws — or worse,
+  acts on a half-filled widget — in the middle of its own rebuild.
+
+* Nothing is corrected in place. A blank-subtracted readout keeps the
+  original as "<name> (raw)", a normalised one is added as a new
+  column. The table is meant to be auditable afterwards.
+"""
+
 import sys
 import os
 import pandas as pd
@@ -19,7 +62,8 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 from src.excel_loader import DataLoader, sheet_names, read_grid
-from src.plotting import PlottingEngine, PALETTE_NAMES, palette_colors
+from src.plotting import (PlottingEngine, PALETTE_NAMES, palette_colors,
+                          point_at)
 from src.groups_panel import GroupsPanel
 from src import curves
 from src.layout_tab import LayoutTab
@@ -34,6 +78,9 @@ from src import theme
 from src.table_model import PandasModel
 from src import project
 
+#: Shown in a combo box when a column is optional and none is chosen.
+#: A sentinel string rather than an empty entry, so the choice reads as
+#: deliberate rather than as a widget that failed to populate.
 NO_SELECTION = "(none)"
 DATA_FILTER = "Data files (*.xlsx *.xlsm *.xls *.csv *.tsv *.txt)"
 DATA_EXT = (".xlsx", ".xlsm", ".xls", ".csv", ".tsv", ".txt")
@@ -56,10 +103,16 @@ class PasteableTableWidget(QTableWidget):
             super().keyPressEvent(event)
 
     def paste_from_clipboard(self):
+        """Paste a tab-separated block, starting at the current cell."""
         text = QApplication.clipboard().text()
         if not text:
             return
+        # All three line endings normalised: the clipboard carries
+        # whatever the source application used, and Excel on Windows
+        # uses \r\n while older Mac software used bare \r.
         rows = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        # Spreadsheets put a trailing newline on a copied block, which
+        # would otherwise paste an empty row over real data.
         while rows and rows[-1] == "":
             rows.pop()
         if not rows:
@@ -72,6 +125,9 @@ class PasteableTableWidget(QTableWidget):
             cells = row_text.split("\t")
             for c_off, val in enumerate(cells):
                 r, c = start_row + r_off, start_col + c_off
+                # Clipped to the grid rather than growing it: a plate is
+                # a fixed shape, and silently adding wells would hide
+                # that the wrong block was copied.
                 if r < self.rowCount() and c < self.columnCount():
                     item = self.item(r, c)
                     if item is None:
@@ -80,9 +136,13 @@ class PasteableTableWidget(QTableWidget):
                     item.setText(val.strip())
 
     def copy_to_clipboard(self):
+        """Copy the selection as tab-separated text, Excel-style."""
         selected = self.selectedIndexes()
         if not selected:
             return
+        # The bounding rectangle of the selection, not the selected
+        # cells themselves: text on a clipboard has to be rectangular,
+        # so a gap inside the block is emitted as an empty cell below.
         rows = sorted(set(idx.row() for idx in selected))
         cols = sorted(set(idx.column() for idx in selected))
         lines = []
@@ -141,12 +201,24 @@ class PlateGridEditor(QWidget):
         copy_btn.clicked.connect(self.table.copy_to_clipboard)
 
     def set_shape(self, n_rows, n_cols):
+        """Resize the grid, keeping whatever is already in it.
+
+        Existing items are left alone and only the missing ones are
+        created, so growing a 96-well grid to 384 does not wipe the
+        values already entered.
+        """
         self.n_rows, self.n_cols = n_rows, n_cols
         self.table.setRowCount(n_rows)
         self.table.setColumnCount(n_cols)
+        # well_id gives "A1"; the [:-1] drops the column number, leaving
+        # the row letter. Taken from plate_reader so the lettering here
+        # and the lettering used when reading a file cannot diverge —
+        # including past row Z on a 384-well plate.
         self.table.setVerticalHeaderLabels([pr.well_id(r, 0)[:-1] for r in range(n_rows)])
         self.table.setHorizontalHeaderLabels([str(c + 1) for c in range(n_cols)])
-        # every column visible without scrolling sideways
+        # Stretch so all 12 (or 24) columns fit without scrolling: a
+        # plate is read as a shape, and a plate you have to scroll
+        # sideways to see is no longer a plate.
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setMinimumSectionSize(28)
         for r in range(n_rows):
@@ -172,6 +244,9 @@ class PlateGridEditor(QWidget):
         file_path, _ = QFileDialog.getOpenFileName(self, "Load Plate Grid", "", DATA_FILTER)
         if not file_path:
             return
+        # find_plate_blocks looks for row letters beside column numbers
+        # anywhere in the sheet, so the instrument's preamble and several
+        # grids in one file are both handled.
         try:
             blocks = pr.find_plate_blocks(read_grid(file_path))
         except Exception as e:
@@ -182,6 +257,9 @@ class PlateGridEditor(QWidget):
                 "Could not find a plate layout (row letters beside column numbers) "
                 "in this file. Please check the file or enter values manually.")
             return
+        # One grid: take it. Several: ask, because a plate-reader export
+        # commonly holds raw and normalised versions of the same read and
+        # picking the wrong one is silent.
         block = blocks[0]
         if len(blocks) > 1:
             titles = [f"{b['title']}  ({b['n_rows']}×{b['n_cols']})" for b in blocks]
@@ -191,6 +269,8 @@ class PlateGridEditor(QWidget):
             if not ok:
                 return
             block = blocks[titles.index(choice)]
+        # Grow to fit the imported block but never shrink: the grid may
+        # already hold a larger layout the user has typed into.
         self.set_shape(max(self.n_rows, block["n_rows"]), max(self.n_cols, block["n_cols"]))
         self.set_cells(block["cells"])
 
@@ -212,17 +292,31 @@ class PlateGridEditor(QWidget):
 
 
 def suggest_readout_name(title):
-    """'Raw Data (485-15/528-20 1)' -> 'GFP (485/528)', '(600)' -> 'OD600'."""
+    """'Raw Data (485-15/528-20 1)' -> 'GFP (485/528)', '(600)' -> 'OD600'.
+
+    Plate readers name their grids after the optics, not the experiment.
+    Guessing the fluorophore from the excitation and emission pair turns
+    an unreadable heading into a column name that means something; the
+    wavelengths are kept in brackets so the guess can be checked, and
+    the name is editable in the import dialog either way.
+    """
     import re
+    # "485-15/528-20" is centre-bandwidth pairs; the bandwidths are
+    # skipped by the optional group and only the centres are kept.
     m = re.search(r"\((\d{3})(?:-\d+)?/(\d{3})", title)
+    # Plate readers label an already-divided grid "normalised"; carrying
+    # that into the name stops a second division going unnoticed.
     norm = " / OD" if re.search(r"normali", title, re.I) else ""
     if m:
         ex, em = int(m.group(1)), int(m.group(2))
+        # Standard filter sets, widest-known first. Anything unmatched
+        # falls through to "Ex485", which is honest rather than wrong.
         name = ("GFP" if 470 <= ex <= 500 and 500 <= em <= 545 else
                 "mKate" if 560 <= ex <= 600 and em >= 610 else
                 "RFP" if 540 <= ex <= 590 and em >= 590 else
                 "BFP" if ex < 420 else f"Ex{ex}")
         return f"{name}{norm} ({ex}/{em})"
+    # A single wavelength with no emission is absorbance, i.e. OD600.
     m = re.search(r"\((\d{3})\)", title)
     if m:
         return f"OD{m.group(1)}{norm}"
@@ -535,10 +629,17 @@ class BioStatExplorer(QMainWindow):
         # --- Data ---
         data_scroll, f = form_page()
         self.chart_selector = combo(self.update_plot)
+        # Grouped by what they are for, because the list is now long
+        # enough that alphabetical order would hide the chart someone
+        # wants behind one they have never needed.
         self.chart_selector.addItems(["Bar", "Box + Swarm", "Boxplot", "Violin", "Beeswarm",
-                                      "Scatter", "Line", PlottingEngine.GROWTH_CHART,
+                                      "Raincloud", "Dot plot",
+                                      "Scatter", "Bubble chart", "Line",
+                                      PlottingEngine.GROWTH_CHART,
+                                      "Density (overlaid)", "Ridge plot",
                                       "Stacked Bar", "Stacked Histogram",
                                       "Heatmap", "Volcano Plot", "Dendrogram", "Network Graph",
+                                      "Venn diagram", "UpSet plot",
                                       "Model vs Measured",
                                       "Model vs Measured (bars)"])
         f.addRow("Graph", self.chart_selector)
@@ -560,6 +661,40 @@ class BioStatExplorer(QMainWindow):
             "same measurement.")
         self._predicted2_label = QLabel("Compare with")
         f.addRow(self._predicted2_label, self.predicted2_selector)
+        # The shaded tolerance band on the scatter. Two widgets rather
+        # than one, so the factor can be set to whatever the field
+        # treats as agreement — twofold for expression work, tighter
+        # elsewhere — while the checkbox keeps it off by default.
+        self.fold_band_cb = check("Shade agreement within")
+        self.fold_band_cb.setToolTip(
+            "Shades the region within a chosen factor of perfect "
+            "agreement, and reports how many points fall inside it.")
+        self.fold_band_spin = spin(1.1, 100.0, 2.0, decimals=1)
+        self.fold_band_spin.setSuffix(" ×")
+        self.fold_band_spin.setSingleStep(0.5)
+        self.fold_band_spin.setToolTip(
+            "A point inside the band is predicted to within this factor.")
+        # Greyed out until the band is on. Connected here rather than
+        # left to the chart-change handler, which only runs when the
+        # graph type changes and so would leave the spin box disabled
+        # for as long as the user stayed on this chart.
+        self.fold_band_cb.toggled.connect(self.fold_band_spin.setEnabled)
+        self.fold_band_spin.setEnabled(False)
+        _band_row = QHBoxLayout()
+        _band_row.setContentsMargins(0, 0, 0, 0)
+        _band_row.addWidget(self.fold_band_cb)
+        _band_row.addWidget(self.fold_band_spin)
+        _band_row.addStretch(1)
+        self._fold_band_widget = QWidget()
+        self._fold_band_widget.setLayout(_band_row)
+        f.addRow("", self._fold_band_widget)
+        # Bubble charts only: the third measurement, drawn as the area
+        # of each point.
+        self.size_selector = combo(self.update_plot)
+        self.size_selector.setToolTip(
+            "The measurement drawn as the area of each bubble.")
+        self._size_label = QLabel("Bubble size")
+        f.addRow(self._size_label, self.size_selector)
         self.hue_selector = combo(self.update_plot)
         self.hue_selector.setToolTip("Splits each X group into coloured bars/boxes")
         f.addRow("Color by", self.hue_selector)
@@ -767,6 +902,12 @@ class BioStatExplorer(QMainWindow):
         self.plot_figure = Figure(figsize=(6, 5), dpi=100)
         self.plot_canvas = FigureCanvas(self.plot_figure)
         self.plot_canvas.mpl_connect("pick_event", self.on_plot_pick)
+        self.plot_canvas.mpl_connect("button_press_event", self.on_plot_click)
+        self.plot_canvas.setToolTip(
+            "Click a point to read the row behind it. Click the title, an "
+            "axis label or a group name to edit or recolour it.")
+        #: The label put up by the last click on a point, if any.
+        self._point_label = None
         self.ax = self.plot_figure.add_subplot(111)
         self.axes = [self.ax]
         PlottingEngine.generate_plot(None, "", "", "", self.ax)
@@ -1251,6 +1392,13 @@ class BioStatExplorer(QMainWindow):
                                       "in Import Plate-Reader File….")
 
     def _edit_series_times(self):
+        """Name each plate of a series and give it a timepoint.
+
+        The time is read from the file names on import ("16h", "30 min"),
+        which is a guess; this is where it gets corrected. A plate with
+        no time is still a plate, so None is allowed and simply means no
+        Time column is added.
+        """
         dlg = QDialog(self)
         dlg.setWindowTitle("Plate Names and Times")
         lay = QVBoxLayout(dlg)
@@ -1269,18 +1417,29 @@ class BioStatExplorer(QMainWindow):
         dlg.resize(520, 320)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
+        # Undo checkpoint before touching anything — see the note at the
+        # top of the file: every change to the data goes through this.
         self._push_undo()
         for i, p_ in enumerate(self.plate_series):
+            # An emptied name falls back to the old one rather than
+            # leaving a plate with no label.
             p_["name"] = t.item(i, 0).text().strip() or p_["name"]
+            # Decimal comma accepted, as everywhere a number is typed.
             txt = t.item(i, 1).text().strip().replace(",", ".")
             try:
                 p_["time"] = float(txt) if txt else None
             except ValueError:
-                pass
+                pass        # unreadable: keep the previous time
         self._refresh_series_label()
 
     # --- corrections ---
     def _refresh_norm_choices(self):
+        """Repopulate the three correction combos from the current grids.
+
+        Called whenever a grid is added or renamed. The hasattr guard is
+        for the window still being built: grids exist before the
+        correction panel does.
+        """
         if not hasattr(self, "blank_layer_combo"):
             return
         maps = list(self.map_layer_editors)
@@ -1291,16 +1450,23 @@ class BioStatExplorer(QMainWindow):
             combo.blockSignals(True)
             combo.clear()
             combo.addItems(items)
+            # Keep whatever was selected if it still exists — except for
+            # the OD combo, which refuses to hold a non-OD column: after
+            # a reimport its old choice is often a fluorescence grid, and
+            # dividing everything by GFP silently ruins the dataset.
             od_like = lambda n_: "od" in n_.lower() or "600" in n_
             if cur in items and not (combo is self.od_combo and not od_like(cur)):
                 combo.setCurrentText(cur)
             elif combo is self.od_combo:
+                # Guess the OD grid by name, so the common case needs no
+                # setting at all.
                 od = next((n for n in items if "od" in n.lower() or "600" in n), None)
                 if od:
                     combo.setCurrentText(od)
             combo.blockSignals(False)
 
     def _plate_norm_state(self):
+        """The correction settings as plain data, for saving and undo."""
         return {"blank": self.blank_cb.isChecked(), "label": self.blank_label_edit.text(),
                 "layer": self.blank_layer_combo.currentText(),
                 "match": self.blank_match_combo.currentText(),
@@ -1308,6 +1474,12 @@ class BioStatExplorer(QMainWindow):
                 "keep_blanks": self.keep_blanks_cb.isChecked()}
 
     def _restore_plate_norm(self, st):
+        """Put saved correction settings back into the widgets.
+
+        The combos are refilled first, then each value is set only if it
+        still exists — a saved choice naming a grid this file does not
+        have must not be forced in.
+        """
         self._refresh_norm_choices()
         self.blank_cb.setChecked(bool(st.get("blank")))
         self.blank_label_edit.setText(st.get("label", "blank"))
@@ -1319,6 +1491,21 @@ class BioStatExplorer(QMainWindow):
         self.keep_blanks_cb.setChecked(bool(st.get("keep_blanks")))
 
     def build_dataset_from_plate(self):
+        """Turn the plate grids into the main table.
+
+        The one place where a plate becomes a dataset. In order:
+
+          1. collect the value grids (per plate, if this is a series)
+          2. collect the map grids — strain, medium, blank — once; one
+             plate map applies to every plate in a series
+          3. per plate: each grid long-form, merged on Well, then the
+             maps merged on, then Plate and Time columns added
+          4. concatenate the plates, apply blank and OD corrections
+          5. drop the wells that were never read, and ingest
+
+        Nothing is written to self.df until ingest_dataframe() at the
+        end, so an early return leaves the current dataset untouched.
+        """
         n_rows, n_cols = pr.PLATE_SHAPES[self.plate_size_selector.currentText()]
 
         if not self.value_layer_editors:
@@ -1326,9 +1513,15 @@ class BioStatExplorer(QMainWindow):
             return
         metric_names = list(self.value_layer_editors.keys())
         self._store_series_plate()
+        # A single plate is treated as a series of one, so the loop
+        # below has no special case. name=None is what suppresses the
+        # Plate column for the single-plate case.
         plates = self.plate_series or [{"name": None, "time": None, "values": {
             n: e.get_grid_values() for n, e in self.value_layer_editors.items()}}]
 
+        # The plate map is read once, outside the plate loop: a time
+        # series is the same physical plate read repeatedly, so the
+        # strain and medium of each well do not change between reads.
         layer_dfs = []
         for name, editor in self.map_layer_editors.items():
             grid = editor.get_grid_values()
@@ -1339,16 +1532,26 @@ class BioStatExplorer(QMainWindow):
             value_dfs = [pr.grid_to_long(plate["values"].get(name, [[""] * n_cols] * n_rows),
                                          value_name=name, n_rows=n_rows, n_cols=n_cols)
                          for name in metric_names]
+            # Outer merge on the well: a well read for OD but not for
+            # GFP keeps its OD rather than being dropped by an inner
+            # join, and the missing value stays NaN.
             merged_values = value_dfs[0]
             for vdf in value_dfs[1:]:
                 merged_values = merged_values.merge(vdf, on=["Well", "Row", "Column"], how="outer")
             merged = pr.merge_well_layers(merged_values, layer_dfs)
+            # Inserted at the front so they read as identifiers rather
+            # than measurements. Time is added only when at least one
+            # plate has one — a column of None would otherwise appear
+            # as a groupable variable that means nothing.
             if plate["name"] is not None:
                 merged.insert(0, "Plate", plate["name"])
                 if any(p_.get("time") is not None for p_ in plates):
                     merged.insert(1, "Time (h)", plate.get("time"))
             frames.append(merged)
         merged = pd.concat(frames, ignore_index=True)
+        # Every value grid empty: almost always a grid that was added
+        # and never filled, so say so rather than building an empty
+        # dataset that fails further downstream.
         if merged[metric_names].dropna(how="all").empty:
             QMessageBox.warning(self, "No values found",
                 "All raw plate value grids are empty. Type values in, or use 'Load From File...' first.")
@@ -1364,7 +1567,10 @@ class BioStatExplorer(QMainWindow):
                 match_col=None if match == "(whole plate)" else match,
                 plate_col="Plate" if "Plate" in merged else None, od=od,
                 keep_blanks=self.keep_blanks_cb.isChecked())
-        # empty wells (no reading at all) aren't samples
+        # Wells with no reading at all are not samples — an unused
+        # corner of the plate should not become a row of NaN that every
+        # later count and mean has to ignore. how="all" keeps a well
+        # that was read for one metric but not another.
         merged = merged.dropna(subset=metric_names, how="all").reset_index(drop=True)
 
         append = False
@@ -1496,6 +1702,9 @@ class BioStatExplorer(QMainWindow):
         """
         if df is None or df.empty:
             return
+        # Checkpoint before replacing data, but not while a saved state
+        # is being restored — that is already a defined point in the
+        # history and recording it would duplicate the entry.
         if self.master_df is not None and not getattr(self, "_restoring", False):
             self._push_undo()
         if source_label and "Source File" not in df.columns:
@@ -1507,16 +1716,28 @@ class BioStatExplorer(QMainWindow):
         else:
             combined = df.copy()
 
+        # Two frames, and the distinction runs through the whole app:
+        #   master_df    everything that was loaded; never filtered
+        #   filtered_df  what the dock filters have left; what is shown
+        # Copies so that a later in-place edit of one cannot reach the
+        # other through a shared block.
         self.master_df = combined.copy()
         self.filtered_df = combined.copy()
         # Classify by actual dtype: any numeric column is a plottable metric,
         # everything else (Strain, Medium, Well...) is filterable metadata.
+        # dtype decides, not the column name: whatever the loader
+        # managed to convert to numbers is something you can plot, and
+        # everything left is something you can group by. Getting this
+        # wrong is why a column of numbers stored as text is worth the
+        # trouble the loader goes to.
         self.metric_cols = [c for c in combined.columns if pd.api.types.is_numeric_dtype(combined[c])]
         self.metadata_cols = [c for c in combined.columns if c not in self.metric_cols]
         if "Source File" not in self.metadata_cols and "Source File" in combined.columns:
             self.metadata_cols.append("Source File")
         if not append:
             # a new dataset: forget the previous one's filters and labels
+            # — a filter naming a strain that no longer exists would
+            # silently hide every row.
             self.dock_filter_selections = {}
             self.value_filter_list.clear()
             self.group_order = []
@@ -1525,9 +1746,14 @@ class BioStatExplorer(QMainWindow):
         self.display_data(self.filtered_df)
         self.metadata_col_list.clear()
         self.metadata_col_list.addItems(self.metadata_cols)
+        # Order matters for the next three lines: the selection panel
+        # must exist before update_selectors() chooses defaults from it,
+        # and both must happen before anything tries to draw.
         self.rebuild_data_selection_panel()      # before plotting with it
         if not append:
             self._one_population_at_a_time()
+        # Appending keeps the current choices — the new rows are more
+        # of the same experiment. Replacing picks fresh defaults.
         self.update_selectors(choose_defaults=not append)
         note = getattr(self, "_load_note", "")
         self._load_note = ""
@@ -1599,9 +1825,23 @@ class BioStatExplorer(QMainWindow):
         self.x_selector.blockSignals(False)
         self.y_selector.blockSignals(False)
         self._rebuild_predicted_selectors(metric_candidates)
+        self._rebuild_size_selector(metric_candidates)
         self.rebuild_hue_and_pairing_selectors()
         self.rebuild_reference_selector()
         self.update_plot()
+
+    def _rebuild_size_selector(self, metric_candidates):
+        """The numeric columns a bubble's area can be taken from."""
+        current = self.size_selector.currentText()
+        self.size_selector.blockSignals(True)
+        self.size_selector.clear()
+        self.size_selector.addItem(NO_SELECTION)
+        self.size_selector.addItems(metric_candidates)
+        if current in metric_candidates:
+            self.size_selector.setCurrentText(current)
+        else:
+            self.size_selector.setCurrentIndex(0)
+        self.size_selector.blockSignals(False)
 
     def _rebuild_predicted_selectors(self, metric_candidates):
         """The model columns for the model-vs-measured charts.
@@ -1632,6 +1872,31 @@ class BioStatExplorer(QMainWindow):
 
     CHART_HELP = {
         "Heatmap": "Rows = X groups; columns = Color by (or every metric if empty).",
+        "Raincloud": "Half violin, box and every reading, side by side per "
+                     "group — the shape, the summary and the n, all at "
+                     "once. Significance brackets work on it.",
+        "Dot plot": "Group means ± error on one horizontal axis, ranked. "
+                    "Stays readable with thirty groups, and is not "
+                    "anchored at zero — so it suits fold changes and "
+                    "normalised values that bars would misrepresent.",
+        "Density (overlaid)": "One smoothed distribution per group, all on "
+                              "the same axis. The ticks along the bottom "
+                              "are the actual readings, so a smooth curve "
+                              "drawn from four points can be seen for what "
+                              "it is.",
+        "Ridge plot": "The same distributions on their own baselines, for "
+                      "when there are too many groups to overlay. Curves "
+                      "are scaled to equal height, so heights are not "
+                      "comparable — positions and widths are.",
+        "Bubble chart": "X and Metric as usual, with 'Bubble size' as a "
+                        "third measurement drawn as the area of each "
+                        "point. Click a bubble to read the row behind it.",
+        "Venn diagram": "The X groups are the sets; 'Color by' names what "
+                        "is in them (gene, construct, strain). Two or "
+                        "three sets — past that, use the UpSet plot.",
+        "UpSet plot": "Same inputs as the Venn, any number of sets. Each "
+                      "column is one exact combination, so the columns "
+                      "add up to the total.",
         "Volcano Plot": "X = log2 fold change column, Metric = p-value column; "
                         "Color by labels the points.",
         "Dendrogram": "Clusters the X groups using every numeric column.",
@@ -1675,7 +1940,8 @@ class BioStatExplorer(QMainWindow):
                      and self.error_style_selector.currentText()
                      == PlottingEngine.MEAN_ONLY)
         for w in (self._error_bars_label, self.error_bars_selector):
-            w.setVisible(curve_chart and not mean_only)
+            w.setVisible((curve_chart and not mean_only)
+                         or chart == "Dot plot")
         for w in (self._error_style_label, self.error_style_selector):
             w.setVisible(chart == PlottingEngine.GROWTH_CHART)
         growth = chart == PlottingEngine.GROWTH_CHART
@@ -1710,6 +1976,13 @@ class BioStatExplorer(QMainWindow):
         for w in (self._predicted_label, self.predicted_selector,
                   self._predicted2_label, self.predicted2_selector):
             w.setVisible(model_chart)
+        # Scatter only: the bar form has no diagonal for a band to
+        # straddle, so the control would be offering something it
+        # cannot draw.
+        for w in (self._size_label, self.size_selector):
+            w.setVisible(chart == "Bubble chart")
+        self._fold_band_widget.setVisible(chart == "Model vs Measured")
+        self.fold_band_spin.setEnabled(self.fold_band_cb.isChecked())
         for w in [self._break_section, self.axis_break_cb] + self._break_rows:
             w.setVisible(chart == "Line")
         paired = self.stat_mode_selector.currentText() in StatisticsEngine.PAIRED
@@ -1813,16 +2086,31 @@ class BioStatExplorer(QMainWindow):
         return filter_map
 
     def get_active_plot_df(self):
+        """Exactly the rows the plot and the statistics should use.
+
+        Two filter layers, applied in order: the dock filters already
+        baked into filtered_df, then the dashboard's own "Show only"
+        tick lists on top. Everything that draws or tests calls this
+        rather than reading filtered_df, so a figure and the p-value
+        printed beside it can never be computed from different rows.
+        """
         if self.filtered_df is None:
             return None
         return FilterEngine.apply_multi_filter(self.filtered_df, self.get_plot_filter_map())
 
     def get_selected_metrics(self):
+        """Which metrics to draw: all of them, or just the chosen one."""
         if self.show_all_metrics_cb.isChecked() and getattr(self, 'metric_cols', None):
+            # Intersected with the columns actually present: metric_cols
+            # is from the whole dataset, and a curve fit or a filter can
+            # leave the current frame with fewer.
             df_cols = list(self.filtered_df.columns) if self.filtered_df is not None else []
             return [c for c in self.metric_cols if c in df_cols]
         current = self.y_selector.currentText()
         return [current] if current else []
+
+    # The four getters below all turn the "(none)" sentinel back into a
+    # real None, so no caller has to know what the combo boxes display.
 
     def get_replicate_col(self):
         rep = self.replicate_selector.currentText()
@@ -2020,6 +2308,9 @@ class BioStatExplorer(QMainWindow):
                     self.custom_titles[metric] = text
                 else:
                     self.custom_titles.pop(metric, None)  # blank -> revert to auto title
+                # Overrides are stored per metric, not on the artist, so
+                # they survive the next redraw — which rebuilds every
+                # artist from scratch.
                 self.update_plot()
 
         elif url == "edit_xlabel":
@@ -2042,6 +2333,86 @@ class BioStatExplorer(QMainWindow):
                     self.custom_ylabels.pop(metric, None)
                 self.update_plot()
 
+    def _clear_point_label(self):
+        ann = getattr(self, "_point_label", None)
+        if ann is not None:
+            try:
+                ann.remove()
+            except (ValueError, NotImplementedError, AttributeError):
+                pass        # the axes were cleared out from under it
+        self._point_label = None
+
+    #: How many of a row's columns the label shows before it stops. A
+    #: plate-reader sheet can have thirty, and a label that tall covers
+    #: the graph it is explaining.
+    POINT_LABEL_FIELDS = 8
+
+    def on_plot_click(self, event):
+        """Name the data point under the click, on any graph.
+
+        Each chart records where it drew every row (see
+        PlottingEngine.register_points), so this is the same gesture and
+        the same label everywhere — a volcano point, a bubble, a dot in a
+        swarm. Clicking anywhere else takes the label away again.
+        """
+        ax = event.inaxes
+        if ax is None or event.button != 1:
+            self._clear_point_label()
+            self.plot_canvas.draw_idle()
+            return
+        # The title, the axis labels and the group names are editable by
+        # clicking, through pick_event. Both firing on one click would
+        # open a colour picker and put up a data label at the same time,
+        # so the editable text wins wherever they overlap.
+        guards = [ax.title, ax.xaxis.label, ax.yaxis.label]
+        guards += list(ax.get_xticklabels()) + list(ax.get_yticklabels())
+        legend = ax.get_legend()
+        if legend is not None:
+            guards += list(legend.get_texts())
+        for artist in guards:
+            try:
+                if artist.get_picker() and artist.contains(event)[0]:
+                    return
+            except (AttributeError, TypeError, ValueError):
+                continue
+
+        hit = point_at(ax, event)
+        self._clear_point_label()
+        if hit is None:
+            self.plot_canvas.draw_idle()
+            return
+        title, fields, (x, y), note = hit
+        shown = fields[:self.POINT_LABEL_FIELDS]
+        lines = [title] + [f"{k}: {v}" for k, v in shown]
+        if len(fields) > len(shown):
+            lines.append(f"(+{len(fields) - len(shown)} more columns)")
+        if note:
+            lines.append(note)
+
+        from src.theme import plot_colors
+        pc = plot_colors(self.is_dark_mode)
+        # Put the label on whichever side of the point has room, so one
+        # near the right edge is not written off the figure.
+        def side(value, lo, hi, flip_at):
+            span = hi - lo
+            frac = (value - lo) / span if span else 0.5
+            return 1 if frac < flip_at else -1
+        sx = side(x, *ax.get_xlim(), 0.62)
+        sy = side(y, *ax.get_ylim(), 0.75)
+        self._point_label = ax.annotate(
+            "\n".join(lines), xy=(x, y), xytext=(14 * sx, 14 * sy),
+            textcoords="offset points", fontsize=8.5, zorder=30,
+            ha="left" if sx > 0 else "right",
+            va="bottom" if sy > 0 else "top",
+            color=pc["text"], annotation_clip=False,
+            bbox=dict(boxstyle="round,pad=0.45", facecolor=pc["bg"],
+                      edgecolor=pc["text"], linewidth=0.8, alpha=0.96),
+            arrowprops=dict(arrowstyle="-", color=pc["text"], linewidth=0.8,
+                            shrinkA=0, shrinkB=3))
+        self.plot_canvas.draw_idle()
+        self.status_bar.showMessage(
+            "  ·  ".join([title] + [f"{k} {v}" for k, v in shown[:4]]), 10000)
+
     def _current_group_order(self):
         """The active x-axis category order: manual overrides layered on top
         of the natural (first-seen-in-data) order, for whatever the plot is
@@ -2050,9 +2421,17 @@ class BioStatExplorer(QMainWindow):
         x_col = self.x_selector.currentText()
         if df is None or not x_col or x_col not in df.columns:
             return []
+        # .unique() keeps first-seen order, which for a plate is the
+        # order the wells were read — far more meaningful than
+        # alphabetical. astype(str) because the column may hold numbers
+        # and the manual order is stored as strings.
         natural = list(df[x_col].dropna().unique().astype(str))
         if not self.group_order:
             return natural
+        # The manual order is layered on top rather than replacing the
+        # natural one: groups the user has moved come first in their
+        # chosen order, and anything that appeared since (a new strain,
+        # a filter being relaxed) is appended rather than vanishing.
         ordered = [g for g in self.group_order if g in natural]
         remaining = [g for g in natural if g not in ordered]
         return ordered + remaining
@@ -2075,10 +2454,13 @@ class BioStatExplorer(QMainWindow):
         act_start = menu.addAction("Move to Start")
         act_end = menu.addAction("Move to End")
 
+        # exec() blocks until something is picked; None means dismissed.
         chosen = menu.exec(QCursor.pos())
         if chosen is None:
             return
 
+        # Identity comparison on the QAction, not its text: the labels
+        # are user-visible strings and would break if ever translated.
         if chosen is act_left:
             order[idx - 1], order[idx] = order[idx], order[idx - 1]
         elif chosen is act_right:
@@ -2090,6 +2472,8 @@ class BioStatExplorer(QMainWindow):
         else:
             return
 
+        # Checkpoint first, then commit — reordering groups is a change
+        # to the figure that someone will want to take back.
         self._push_undo()
         self.group_order = order
         self.update_plot()
@@ -2103,6 +2487,9 @@ class BioStatExplorer(QMainWindow):
         ax_left.set_xlim(self.axis_break_left_min.value(), self.axis_break_left_max.value())
         ax_right.set_xlim(self.axis_break_right_min.value(), self.axis_break_right_max.value())
 
+        # Hide the two spines facing the gap, and the right panel's y
+        # tick labels: the axes are shared, so repeating them would say
+        # the same thing twice and imply two different scales.
         ax_left.spines['right'].set_visible(False)
         ax_right.spines['left'].set_visible(False)
         ax_right.tick_params(labelleft=False)
@@ -2115,6 +2502,11 @@ class BioStatExplorer(QMainWindow):
         if left_legend is not None:
             left_legend.remove()
 
+        # The diagonal break marks. The marker is given as an explicit
+        # two-point path — a short line from (-1,-d) to (1,d) — because
+        # matplotlib has no slanted-tick marker. clip_on=False is what
+        # lets them be drawn outside the axes, straddling the gap, and
+        # transAxes places them at the corners whatever the data range.
         d = 0.4
         break_kwargs = dict(marker=[(-1, -d), (1, d)], markersize=8, linestyle="none",
                              color='k', mec='k', mew=1, clip_on=False)
@@ -2138,7 +2530,14 @@ class BioStatExplorer(QMainWindow):
             "predicted": [c for c in (self.predicted_selector.currentText(),
                                       self.predicted2_selector.currentText())
                           if c and c != NO_SELECTION],
+            # None when off, so the drawing code has one thing to test
+            # rather than a flag and a value that could disagree.
+            "fold_band": (self.fold_band_spin.value()
+                          if self.fold_band_cb.isChecked() else None),
             "all_metrics": self.show_all_metrics_cb.isChecked(),
+            "size": (self.size_selector.currentText()
+                     if self.size_selector.currentText() != NO_SELECTION
+                     else None),
             "hue": self.get_hue(),
             "reference": self.get_reference(),
             "pairing": self.get_pairing_col(),
@@ -2209,6 +2608,7 @@ class BioStatExplorer(QMainWindow):
             custom_ylabel=spec["ylabels"].get(y_col), group_order=spec["group_order"],
             show_ns=spec["show_ns"], hue_order=spec["hue_order"],
             predicted_cols=spec.get("predicted"),
+            fold_band=spec.get("fold_band"),
             error_bars=spec.get("error_bars", "SD"),
             fit_curve=spec.get("fit_curve", True),
             smooth_error=spec.get("smooth_error", True),
@@ -2218,12 +2618,14 @@ class BioStatExplorer(QMainWindow):
                                    PlottingEngine.NO_CURVE_STAT),
             replicate_col=spec.get("replicate"),
             curve_model=spec.get("curve_model"),
+            size_col=spec.get("size"),
             log_x=bool(spec.get("log_x")))
         return y_col
 
     def update_plot(self):
         if getattr(self, "_building", False):
             return
+        self._point_label = None        # cleared with the figure below
         df = self.get_active_plot_df()
         spec = self.plot_spec()
         x_col, metrics = spec["x"], spec["metrics"]
@@ -2321,6 +2723,29 @@ class BioStatExplorer(QMainWindow):
         self.run_statistical_pipeline()
 
     def run_statistical_pipeline(self):
+        """Run the right test for the current plot, and write the report.
+
+        Which test runs is decided by the shape of the question, not by
+        this method — StatisticsEngine does that. What happens here is
+        the routing between three cases:
+
+            two-way ANOVA   X and a Color By, when asked for explicitly
+            within-group    a Color By present: compare its levels
+                            inside each X group, Holm-corrected across
+                            the X groups as well
+            plain           no Color By: compare the X groups
+
+        Run once per metric, so "show all metrics" produces one report
+        per column. Two things are deliberately kept in step with the
+        figure: the rows come from get_active_plot_df(), the same call
+        the plot uses, and the group order comes from the same
+        _current_group_order(), so the report reads in the order the
+        bars appear.
+
+        Outliers are found per metric and *reported* whether or not
+        they are excluded — a flagged point nobody was told about is
+        the worst of the three outcomes.
+        """
         df = self.get_active_plot_df()
         x_var = self.x_selector.currentText()
         metrics = self.get_selected_metrics()
@@ -2329,6 +2754,9 @@ class BioStatExplorer(QMainWindow):
                                            "Metric on the Plotting Dashboard first.")
             return
         test = self.stat_mode_selector.currentText()
+        # "None" means "do not draw stars on the figure", not "do not
+        # compute anything" — the Statistics tab was asked for
+        # explicitly, so fall back to choosing a test automatically.
         if test == StatisticsEngine.NONE:
             test = StatisticsEngine.AUTO
         hue = self.get_hue()
@@ -2336,15 +2764,28 @@ class BioStatExplorer(QMainWindow):
         exclude = self.exclude_outliers_cb.isChecked()
         texts, rows, tables = [], [], []
         for y_var in metrics:
+            # Outliers are found within each group (and each hue level),
+            # not across the whole column — a value that is ordinary for
+            # the mutant may be extreme for the wild type.
             flags = StatisticsEngine.find_outliers(df, x_var, y_var, hue)
             out_txt = self._outlier_text(df, flags, x_var, y_var, hue, exclude)
+            # The text is built before the exclusion, so it can say what
+            # was found whichever way the checkbox is set.
             data = df[~flags] if exclude else df
+            # The summary table shows one metric; the first is the one
+            # the user actually chose, the rest come from "show all".
             if y_var == metrics[0]:
                 self.update_summary_table_view(data)
+            # --- case 1: two-way ANOVA --------------------------------
+            # Needs both factors, so it is only reachable with a Color By
+            # column set as well as an X.
             if test == StatisticsEngine.TWO_WAY and hue:
                 table, results = StatisticsEngine.two_way(data, x_var, hue, y_var, self.hue_order)
                 lines = ["=== TWO-WAY ANOVA ===", "",
                          f"'{y_var}' by '{x_var}' and '{hue}' (type II sums of squares)", ""]
+                # Rows 0-2 are the two main effects and the interaction;
+                # row 3 is the residual, whose df is the denominator of
+                # every F ratio above it.
                 for t in table[:3]:
                     lines.append(f"  - {t['Effect']}: F({t['df']:g}, {table[3]['df']:g}) = "
                                  f"{t['F']:.3f}, {format_p(t['p'])} {stars(t['p'])}; "
@@ -2359,6 +2800,7 @@ class BioStatExplorer(QMainWindow):
                     rows += self._comparison_rows(r, y_var, f"{x_var} = {g}")
                 tables.append(pd.DataFrame(table).assign(Metric=y_var))
                 texts.append("\n".join(lines) + out_txt)
+            # --- case 2: compare the hue levels inside each X group ---
             elif hue:
                 results = StatisticsEngine.compare_within(
                     data, x_var, hue, y_var, test, self.get_reference(),
@@ -2366,14 +2808,22 @@ class BioStatExplorer(QMainWindow):
                 for g, r in results.items():
                     texts.append(StatisticsEngine.format_report(r, hue, y_var, within=f"{x_var} = {g}"))
                     rows += self._comparison_rows(r, y_var, f"{x_var} = {g}")
+                # Said explicitly, because it is the correction people
+                # forget: each X group is a whole family of comparisons,
+                # and running several of them multiplies the chances of
+                # a false positive again.
                 note = (f"Note: p-values are also Holm-corrected across the {len(results)} "
                         f"'{x_var}' groups." if len(results) > 1 else "")
                 texts.append(note + out_txt)
+            # --- case 3: plain comparison of the X groups -------------
             else:
                 r = StatisticsEngine.compare(data, x_var, y_var, test, self.get_reference(),
                                              self.get_pairing_col(), group_order=order)
                 texts.append(StatisticsEngine.format_report(r, x_var, y_var) + out_txt)
                 rows += self._comparison_rows(r, y_var)
+        # Kept on the window so the Excel and PDF exports write exactly
+        # the comparisons that are on screen, rather than recomputing
+        # and risking a different answer.
         self.current_comparisons = pd.DataFrame(rows)
         self.current_anova_tables = pd.concat(tables) if tables else None
         self.stats_output.setPlainText(("\n\n" + "-" * 60 + "\n\n").join(t for t in texts if t))
@@ -2476,6 +2926,27 @@ class BioStatExplorer(QMainWindow):
         self.update_plot()
 
     def _apply_spec(self, sp):
+        """Put a saved figure specification back into the controls.
+
+        Harder than it looks, for three reasons, all visible below:
+
+        1. Every widget is blocked for the whole operation. Each
+           setCurrentText would otherwise fire a redraw, so restoring
+           sixteen controls would redraw sixteen times — each against a
+           half-restored state.
+        2. The order matters. hue, pairing and reference depend on which
+           columns exist, so their lists are rebuilt in the middle,
+           after the x and y choices are in and before those three are
+           set.
+        3. A value is only applied if the widget actually offers it
+           (findText >= 0). A project saved from another dataset names
+           columns this one may not have, and forcing them in would
+           leave a control claiming a column that is not there.
+
+        The blanket `for key in ...` loops therefore skip absent keys —
+        which is why the explicit defaults at the end exist, for options
+        added after some projects were saved.
+        """
         if not sp:
             return
         widgets = [self.chart_selector, self.x_selector, self.y_selector, self.hue_selector,
@@ -2484,9 +2955,11 @@ class BioStatExplorer(QMainWindow):
                    self.predicted2_selector, self.error_bars_selector,
                    self.error_style_selector, self.curve_measure_selector,
                    self.replicate_selector, self.curve_model_selector,
-                   self.error_centre_selector]
+                   self.error_centre_selector, self.size_selector]
         for w in widgets:
             w.blockSignals(True)
+        # try/finally: if anything below raises, the widgets must still
+        # be unblocked, or the whole dashboard goes silently dead.
         try:
             for combo, key in ((self.chart_selector, "chart"), (self.x_selector, "x"),
                                (self.y_selector, "y"), (self.palette_selector, "palette"),
@@ -2497,11 +2970,18 @@ class BioStatExplorer(QMainWindow):
                                (self.curve_model_selector, "curve_model")):
                 if sp.get(key) and combo.findText(sp[key]) >= 0:
                     combo.setCurrentText(sp[key])
+            # Rebuilt here, mid-restore: their contents depend on the
+            # x and y columns just set above — see point 2 in the
+            # docstring.
             self.rebuild_hue_and_pairing_selectors()
             self.rebuild_reference_selector()
             for combo, key in ((self.hue_selector, "hue"), (self.reference_selector, "reference"),
                                (self.pairing_selector, "pairing"),
-                               (self.replicate_selector, "replicate")):
+                               (self.replicate_selector, "replicate"),
+                               (self.size_selector, "size")):
+                # Falls back to "(none)" rather than to whatever happens
+                # to be selected: a missing column means the option was
+                # not set, not that it should keep an unrelated value.
                 v = sp.get(key) or NO_SELECTION
                 combo.setCurrentText(v if combo.findText(v) >= 0 else NO_SELECTION)
             pred = list(sp.get("predicted") or [])
@@ -2511,6 +2991,13 @@ class BioStatExplorer(QMainWindow):
                               pred[1] if len(pred) > 1 else NO_SELECTION)):
                 combo.setCurrentText(v if combo.findText(v) >= 0
                                      else NO_SELECTION)
+            # Stored as the factor itself, or None when it was off, so
+            # an older project file without the key simply leaves the
+            # band unchecked.
+            fb = sp.get("fold_band")
+            self.fold_band_cb.setChecked(bool(fb))
+            if fb:
+                self.fold_band_spin.setValue(float(fb))
         finally:
             for w in widgets:
                 w.blockSignals(False)
@@ -2586,13 +3073,30 @@ class BioStatExplorer(QMainWindow):
         self._sync_control_visibility()
 
     # --- undo ---
+    #: How many steps back the stack keeps. Each entry is a whole
+    #: snapshot — the DataFrame included — so this is a memory bound as
+    #: much as a usability one.
     UNDO_LIMIT = 30
 
     def _push_undo(self):
+        """Snapshot the current state, before something changes it.
+
+        Called at the top of every action that alters the data or the
+        figure. The two guards are what stop the stack filling with
+        noise: nothing is recorded while a previous state is being
+        restored (or undo would undo itself), nor while the window is
+        still being built.
+
+        getattr with a default because both flags are set after some of
+        the widgets that can trigger this already exist.
+        """
         if getattr(self, "_restoring", False) or getattr(self, "_building", False):
             return
         self._undo_stack.append(self.state())
+        # Trim from the front, keeping the last UNDO_LIMIT. The slice
+        # deletion handles a short stack without a length check.
         del self._undo_stack[:-self.UNDO_LIMIT]
+        # A new action invalidates the redo branch, as in any editor.
         self._redo_stack.clear()
         self._sync_undo_actions()
         self._mark_dirty()
@@ -2603,14 +3107,18 @@ class BioStatExplorer(QMainWindow):
             self.redo_action.setEnabled(bool(self._redo_stack))
 
     def undo(self):
+        """Step back one state, pushing the current one onto redo."""
         if not self._undo_stack:
             return
+        # Current state saved *before* restoring, which is what makes
+        # redo possible.
         self._redo_stack.append(self.state())
         self.apply_state(self._undo_stack.pop())
         self._sync_undo_actions()
         self.status_bar.showMessage("Undone", 2500)
 
     def redo(self):
+        """Step forward again. The mirror image of undo()."""
         if not self._redo_stack:
             return
         self._undo_stack.append(self.state())
@@ -2618,20 +3126,48 @@ class BioStatExplorer(QMainWindow):
         self._sync_undo_actions()
         self.status_bar.showMessage("Redone", 2500)
 
-    # --- project files ---
+    # ------------------------------------------------------------------
+    # PROJECT FILES (.bse)
+    # ------------------------------------------------------------------
+    # A project holds everything needed to pick the analysis up again:
+    # the data, every graph setting, the colours and group order, the
+    # plate grids and the figure layout. state(for_file=True) gathers
+    # it; apply_state() puts it back.
+    #
+    # The window title carries "[*]", Qt's placeholder for the modified
+    # marker, and setWindowModified() turns it into the platform's own
+    # convention — a dot in the close button on macOS, an asterisk on
+    # Windows. _mark_dirty() is called from _push_undo(), so anything
+    # worth undoing is also something worth saving.
+    # ------------------------------------------------------------------
+
     def _update_title(self):
         name = os.path.basename(self._project_path) if self._project_path else "Untitled"
         self.setWindowTitle(f"{name}[*] — BioStat Explorer")
         self.setWindowModified(self._dirty)
 
     def _mark_dirty(self):
+        """Note that there is something worth saving.
+
+        Same two guards as _push_undo: restoring a state and building
+        the window both change widgets without the user having done
+        anything.
+        """
         if getattr(self, "_restoring", False) or getattr(self, "_building", False):
             return
+        # No data means nothing to save, and the `not self._dirty` test
+        # keeps this to one title update rather than one per keystroke.
         if self.master_df is not None and not self._dirty:
             self._dirty = True
             self._update_title()
 
     def save_project(self):
+        """Save to the current path, or ask for one. True if it worked.
+
+        The return value matters: _confirm_discard() uses it to decide
+        whether closing may continue, so a failed or cancelled save must
+        not be reported as success.
+        """
         if not self._project_path:
             return self.save_project_as()
         try:
@@ -2652,11 +3188,15 @@ class BioStatExplorer(QMainWindow):
         return self.save_project()
 
     def open_project(self, path=None):
+        """Open a .bse, after offering to save what is already here."""
         if not path:
             path, _ = QFileDialog.getOpenFileName(self, "Open Project", self._last_dir(),
                                                   project.FILTER)
             if not path:
                 return
+        # Asked after the file has been chosen but before anything is
+        # read, so Cancel at this point leaves the current analysis
+        # completely untouched.
         if not self._confirm_discard():
             return
         try:
@@ -2665,6 +3205,8 @@ class BioStatExplorer(QMainWindow):
             QMessageBox.warning(self, "Could not open", str(e))
             return
         self._remember_dir(path)
+        # Both stacks cleared: undoing into the previous project's
+        # states would mix two analyses together.
         self._undo_stack.clear()
         self._redo_stack.clear()
         self.apply_state(st)
@@ -2676,6 +3218,13 @@ class BioStatExplorer(QMainWindow):
         self.status_bar.showMessage(f"Opened {os.path.basename(path)}", 4000)
 
     def _confirm_discard(self):
+        """Offer to save before something destructive. True to proceed.
+
+        Three outcomes, which is why this cannot be a yes/no box: Save
+        proceeds only if the save succeeded, Discard proceeds and throws
+        the work away, Cancel stops whatever asked.
+        """
+        # Nothing worth saving: proceed without troubling anyone.
         if not self._dirty or self.master_df is None:
             return True
         name = os.path.basename(self._project_path) if self._project_path else "this analysis"
@@ -2690,8 +3239,12 @@ class BioStatExplorer(QMainWindow):
                                QMessageBox.StandardButton.Cancel)
         box.setDefaultButton(QMessageBox.StandardButton.Save)
         answer = box.exec()
+        # Save returns the save's own success, so a cancelled Save As
+        # cancels the close too rather than losing the work.
         if answer == QMessageBox.StandardButton.Save:
             return self.save_project()
+        # Anything that is not Discard — including closing the box with
+        # Escape — counts as Cancel.
         return answer == QMessageBox.StandardButton.Discard
 
     def closeEvent(self, event):
@@ -2727,7 +3280,20 @@ class BioStatExplorer(QMainWindow):
             w, h, _, _ = self.layout_tab.page_size_mm()
             self.status_bar.showMessage(f"Saved {path} ({w:.0f} × {h:.0f} mm)", 8000)
 
-    # --- curves ---
+    # ------------------------------------------------------------------
+    # CURVES
+    # ------------------------------------------------------------------
+    # Fitting turns the dataset inside out: the table goes from one row
+    # per *reading* to one row per *curve*, with the fitted parameters
+    # as its columns. A growth-rate comparison between strains is then
+    # an ordinary bar chart with an ordinary ANOVA over it, which is
+    # why this replaces self.df rather than opening a separate view.
+    #
+    # Because it is destructive, every path through here pushes an undo
+    # checkpoint (inside ingest_dataframe) and says so in the status
+    # bar — the data is one Cmd-Z away, and nobody would guess that.
+    # ------------------------------------------------------------------
+
     def fit_curves_to_table(self):
         """Fit one curve per replicate and plot the parameters.
 
@@ -2742,21 +3308,35 @@ class BioStatExplorer(QMainWindow):
                                     "Open some data and choose X and Metric "
                                     "first.")
             return
+        # The replicate column is what says which rows belong to the
+        # same curve — usually Well. Without it every point would be
+        # treated as its own curve, so this is a hard requirement
+        # rather than a default.
         if not rep:
             QMessageBox.information(
                 self, "Curves",
                 "Choose a Replicate column on the Stats tab — it says which "
                 "rows belong to the same curve (usually Well).")
             return
+        # One fit per replicate, within each hue level if there is one.
         keys = [c for c in (hue, rep) if c]
+        # Every other column is offered to fit_groups, which copies
+        # across the ones that are constant within a curve — so a well's
+        # Strain and Medium travel with its fitted growth rate and can
+        # be grouped on afterwards.
         keep = [c for c in df.columns if c not in (x, y)]
         model = self.curve_model_selector.currentText()
         params, _ = curves.fit_groups(df, x, y, keys, model, keep=keep)
         if params.empty:
             QMessageBox.information(self, "Curves", "Nothing could be fitted.")
             return
+        # Note is dropped from the data but counted below: it holds the
+        # reason a fit failed, which belongs in a message rather than as
+        # a column of mostly-empty text in every later plot.
         self.ingest_dataframe(params.drop(columns=["Note"], errors="ignore"),
                               append=False, source_label="Curve fits")
+        # Jump the x axis to the grouping column, since the question
+        # after fitting is almost always "growth rate by strain".
         if hue and hue in self.metadata_cols:
             self.x_selector.setCurrentText(hue)
         failed = int(params["Note"].notna().sum()) if "Note" in params else 0
@@ -2789,6 +3369,13 @@ class BioStatExplorer(QMainWindow):
             self.status_bar.showMessage(f"Saved {path}", 6000)
 
     def _save_path(self, title, default_name, ext, filt):
+        """Ask where to save, remembering the folder and fixing the suffix.
+
+        One helper for every export in the app, so they all open in the
+        last folder used and all append the extension when the user
+        typed a bare name — which the native dialogs do not do reliably
+        across platforms.
+        """
         start = os.path.join(self._last_dir(), default_name)
         path, _ = QFileDialog.getSaveFileName(self, title, start, filt)
         if not path:
@@ -2809,6 +3396,12 @@ class BioStatExplorer(QMainWindow):
             self.status_bar.showMessage(f"Figure saved: {path}", 6000)
 
     def _ensure_stats(self):
+        """Run the statistics if they have not been run yet.
+
+        Lets the export buttons work without the user having visited
+        the Statistics tab first; if a report is already there, it is
+        reused rather than recomputed.
+        """
         if not self.stats_output.toPlainText().strip() or getattr(
                 self, "current_comparisons", None) is None:
             self.run_statistical_pipeline()
