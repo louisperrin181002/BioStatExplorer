@@ -26,7 +26,7 @@ Drag a row to move that group; click its colour square to change it."""
 # then no longer match the group it stands for.
 # ---------------------------------------------------------------------------
 
-from PySide6.QtCore import Qt, Signal, QSize, QRect
+from PySide6.QtCore import Qt, Signal, QSize, QRect, QTimer
 from PySide6.QtGui import QColor, QPixmap, QPainter, QIcon
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
@@ -78,15 +78,44 @@ class _GroupList(QListWidget):
         self.setIconSize(QSize(SWATCH, SWATCH))
         self.setSpacing(1)
         # Guard against the panel reacting to its own rebuilds. _fill()
-        # clears and repopulates the list, which Qt reports as rows
-        # moving; without the flag that would emit moved, redraw the
-        # plot, and in the sort case recurse.
+        # clears and repopulates the list; without the flag that would
+        # announce a new order, redraw the plot, and in the sort case
+        # recurse.
         self.filling = False
-        self.model().rowsMoved.connect(
-            lambda *_: None if self.filling else self.moved.emit())
 
     def names(self):
         return [self.item(i).data(_NAME) for i in range(self.count())]
+
+    def dropEvent(self, event):
+        """Announce the new order once a drag has rearranged the rows.
+
+        The obvious wiring — connecting to the model's rowsMoved — looks
+        right and never fires. A QListWidget performs an internal move by
+        inserting a copy of the row and letting the view delete the
+        original afterwards; neither step goes through moveRows(), which
+        is the only thing that emits rowsMoved. So dragging a group
+        rearranged the list on screen, nothing was ever told, and the
+        graph kept its old order while the panel showed the new one.
+
+        The source row is deleted after this returns, back inside
+        startDrag(), so the list reaches its final state only on the next
+        turn of the event loop — hence the zero-delay timer rather than
+        reading the order here, which would still see the duplicate.
+        """
+        before = self.names()
+        super().dropEvent(event)
+        QTimer.singleShot(0, lambda: self._announce(before))
+
+    def _announce(self, before):
+        """Emit *moved*, but only if the drag actually changed anything.
+
+        Compared against the order before the drop rather than trusting
+        that a drop happened: a drag released where it started, or onto
+        the row it came from, is not a reorder and should not redraw the
+        plot or push an undo step.
+        """
+        if not self.filling and self.names() != before:
+            self.moved.emit()
 
     def mousePressEvent(self, event):
         """A click on the swatch opens the colour picker; anything else

@@ -751,8 +751,18 @@ class PlottingEngine:
             # their natural (first-seen) relative order, appended at the end
             # - so a newly-appearing group (new file loaded, filter changed)
             # doesn't just vanish from the axis.
-            ordered = [g for g in group_order if g in unique_groups]
-            remaining = [g for g in unique_groups if g not in ordered]
+            # Matched as text, and mapped back to the column's own
+            # values. The manual order comes from the Groups panel, which
+            # stores names; unique_groups holds whatever the column
+            # contains. With a numeric X column — plate wells, or samples
+            # called 130.1 and 132.1 — "130.1" never equals 130.1, every
+            # name fell through to *remaining*, and reordering silently
+            # did nothing however it was asked for.
+            wanted = [str(g) for g in group_order]
+            by_name = {str(g): g for g in unique_groups}
+            ordered = [by_name[n] for n in wanted if n in by_name]
+            placed = {str(g) for g in ordered}
+            remaining = [g for g in unique_groups if str(g) not in placed]
             unique_groups = ordered + remaining
 
         hue_col = hue_col if (hue_col and hue_col in df.columns and hue_col != x_col) else None
