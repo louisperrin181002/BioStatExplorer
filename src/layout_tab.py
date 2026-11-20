@@ -258,8 +258,18 @@ class LayoutTab(QWidget):
         # The one place millimetres become inches. 25.4 mm to the inch.
         fig.set_size_inches(w_mm / 25.4, h_mm / 25.4)
         if figure is None:
-            dpi = fig.get_dpi()
-            self.canvas.setFixedSize(int(w_mm / 25.4 * dpi), int(h_mm / 25.4 * dpi))
+            # Divided by the device pixel ratio, which is the whole point
+            # of this line. On a Retina screen the Qt backend multiplies
+            # the figure's dpi by that ratio, so fig.get_dpi() reports 200
+            # where the page is 100. Sizing the widget from it made the
+            # widget exactly twice the figure in each direction:
+            # matplotlib painted the top-left quarter and the other three
+            # quarters kept whatever was in the backing store — fragments
+            # of earlier renders, which read on screen as torn text beside
+            # the panels.
+            dpi = fig.get_dpi() / (self.canvas.device_pixel_ratio or 1)
+            self.canvas.setFixedSize(round(w_mm / 25.4 * dpi),
+                                     round(h_mm / 25.4 * dpi))
         if not self.panels:
             fig.text(0.5, 0.5, "No panels yet — add graphs from the Plotting Dashboard "
                      "(＋ Add to Layout).", ha="center", va="center", color="#64748B",
