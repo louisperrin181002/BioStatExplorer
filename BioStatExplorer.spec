@@ -61,7 +61,7 @@ if sys.platform == 'darwin':
         name='BioStatExplorer.app',
         icon='assets/icon.icns',
         bundle_identifier='uk.ac.earlham.biostatexplorer',
-        info_plist={'CFBundleShortVersionString': '2.1.0',
+        info_plist={'CFBundleShortVersionString': '2.1.1',
                     'NSHighResolutionCapable': True},
     )
 else:
